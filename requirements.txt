@@ -3,3 +3,4 @@ sympy
 scipy
 numpy
 gunicorn
+flask-cors
