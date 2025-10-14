@@ -2,13 +2,17 @@
 # It now uses SymPy for symbolic power and SciPy for numerical precision.
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # <--- 1. ADD THIS IMPORT
 from sympy import sympify, N, SympifyError, diff, integrate, Symbol, Abs, lambdify
 from scipy.integrate import quad
 import numpy as np
 
 app = Flask(__name__)
+CORS(app)  # <--- 2. ADD THIS LINE TO ACTIVATE CORS
 
 # --- Health Check Endpoint for UptimeRobot ---
+# (The rest of your code stays exactly the same!)
+# ...
 @app.route('/', methods=['GET'])
 def health_check():
     """A simple endpoint to prove the server is online and accessible."""
