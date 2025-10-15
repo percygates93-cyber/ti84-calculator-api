@@ -1,6 +1,6 @@
-flask
+Flask
+Flask-Cors
 sympy
-scipy
 numpy
+scipy
 gunicorn
-flask-cors
