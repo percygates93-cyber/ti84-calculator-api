@@ -1,10 +1,12 @@
 # Bzzzt! This is the final, production-grade code for your calculator brain.
 # It now uses SymPy for symbolic power and SciPy for numerical precision with an upgraded engine.
+# VERSION 2.0 - NOW WITH NUMERICAL DERIVATIVE POWER!
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sympy import sympify, N, SympifyError, diff, integrate, Symbol, Abs, lambdify
 from scipy.integrate import quad
+from scipy.misc import derivative as numerical_derivative # We need this for nDeriv!
 import numpy as np
 
 app = Flask(__name__)
@@ -88,8 +90,34 @@ def numerical_integrate():
         return jsonify({"result": str(final_result)})
     except Exception as e:
         print(f"A numerical integration error occurred in fnInt: {e}")
-        # Return a clear error message to the GPT
         return jsonify({"error": f"Numerical integration failed. The math is too complex for the engine: {str(e)}"}), 400
+
+# --- [NEW!] Endpoint 5: The TI-84 Powerhouse for Numerical Derivatives ---
+@app.route('/nDeriv', methods=['POST'])
+def numerical_differentiate():
+    """A dedicated, high-power endpoint for numerically evaluating derivatives at a point."""
+    data = request.get_json()
+    expression = data.get('expression')
+    variable = data.get('variable')
+    point = data.get('point')
+
+    if not all([expression, variable, point]):
+        return jsonify({"error": "Invalid request. Provide 'expression', 'variable', and 'point'."}), 400
+
+    try:
+        x = Symbol(variable)
+        # We use the same lambdify trick to convert the expression into a fast numerical function
+        sympy_expr = sympify(expression, locals={"Abs": Abs})
+        numerical_func = lambdify(x, sympy_expr, modules=['numpy'])
+
+        # This is the SciPy magic for numerical derivatives!
+        derivative_result = numerical_derivative(numerical_func, float(point), dx=1e-6)
+        
+        final_result = round(derivative_result, 3)
+        return jsonify({"result": str(final_result)})
+    except Exception as e:
+        print(f"A numerical differentiation error occurred in nDeriv: {e}")
+        return jsonify({"error": f"Numerical differentiation failed. The expression might be too complex or undefined: {str(e)}"}), 400
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
