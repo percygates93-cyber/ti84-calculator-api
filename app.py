@@ -1,18 +1,17 @@
 # Bzzzt! This is the final, production-grade code for your calculator brain.
 # It now uses SymPy for symbolic power and SciPy for numerical precision with an upgraded engine.
-# VERSION 2.0 - NOW WITH NUMERICAL DERIVATIVE POWER!
+# VERSION 2.1 - Patched for modern SciPy compatibility!
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sympy import sympify, N, SympifyError, diff, integrate, Symbol, Abs, lambdify
 from scipy.integrate import quad
-from scipy.misc import derivative as numerical_derivative # We need this for nDeriv!
 import numpy as np
 
 app = Flask(__name__)
 CORS(app)
 
-# --- Health Check Endpoint for UptimeRobot ---
+# --- Health Check Endpoint ---
 @app.route('/', methods=['GET'])
 def health_check():
     """A simple endpoint to prove the server is online and accessible."""
@@ -65,7 +64,7 @@ def integrate_expression():
     except Exception as e:
         return jsonify({"error": "Could not process the integration expression."}), 400
 
-# --- Endpoint 4: The TI-84 Powerhouse for Definite Integrals (ENGINE UPGRADED) ---
+# --- Endpoint 4: The TI-84 Powerhouse for Definite Integrals ---
 @app.route('/fnInt', methods=['POST'])
 def numerical_integrate():
     """A dedicated, high-power endpoint for numerically solving definite integrals."""
@@ -83,7 +82,6 @@ def numerical_integrate():
         sympy_expr = sympify(expression, locals={"Abs": Abs})
         numerical_func = lambdify(x, sympy_expr, modules=['numpy'])
         
-        # THE ENGINE UPGRADE: Increased limit gives the engine more power for tough problems.
         integral_result, _ = quad(numerical_func, float(lower_bound), float(upper_bound), limit=200)
         
         final_result = round(integral_result, 3)
@@ -92,7 +90,7 @@ def numerical_integrate():
         print(f"A numerical integration error occurred in fnInt: {e}")
         return jsonify({"error": f"Numerical integration failed. The math is too complex for the engine: {str(e)}"}), 400
 
-# --- [NEW!] Endpoint 5: The TI-84 Powerhouse for Numerical Derivatives ---
+# --- Endpoint 5: The TI-84 Powerhouse for Numerical Derivatives (PATCHED!) ---
 @app.route('/nDeriv', methods=['POST'])
 def numerical_differentiate():
     """A dedicated, high-power endpoint for numerically evaluating derivatives at a point."""
@@ -105,13 +103,14 @@ def numerical_differentiate():
         return jsonify({"error": "Invalid request. Provide 'expression', 'variable', and 'point'."}), 400
 
     try:
+        x_val = float(point)
         x = Symbol(variable)
-        # We use the same lambdify trick to convert the expression into a fast numerical function
         sympy_expr = sympify(expression, locals={"Abs": Abs})
         numerical_func = lambdify(x, sympy_expr, modules=['numpy'])
 
-        # This is the SciPy magic for numerical derivatives!
-        derivative_result = numerical_derivative(numerical_func, float(point), dx=1e-6)
+        # THE FIX: We now use a standard and stable central difference formula.
+        dx = 1e-7
+        derivative_result = (numerical_func(x_val + dx) - numerical_func(x_val - dx)) / (2 * dx)
         
         final_result = round(derivative_result, 3)
         return jsonify({"result": str(final_result)})
