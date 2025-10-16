@@ -4,3 +4,4 @@ sympy
 numpy
 scipy
 gunicorn
+numdifftools
