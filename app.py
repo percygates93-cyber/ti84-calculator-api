@@ -1,6 +1,6 @@
 # Bzzzt! This is the final, production-grade code for your calculator brain.
-# It uses SymPy for symbolic power and SciPy + NumPy + numdifftools for numerical precision.
-# VERSION 4.0 – AP Calc AB/BC Complete
+# SymPy for symbolic work; SciPy / NumPy / numdifftools for numerical precision.
+# VERSION 4.1 – AP Calc AB/BC Complete + round_final toggle
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -13,26 +13,28 @@ import numdifftools as nd  # High-precision numerical derivatives
 app = Flask(__name__)
 CORS(app)
 
-# ---------------------- Health Check ----------------------
-@app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({"status": "Calculator brain is online and ready!"})
+# ---------------------- Precision helpers ----------------------
+def _maybe_round(x, round_final=True):
+    """Return 3-decimal value only if round_final=True; else full precision float."""
+    try:
+        xf = float(x)
+    except Exception:
+        return x
+    return float(f"{xf:.3f}") if round_final else xf
 
-# ---------------------- Core Helpers ----------------------
+def _bool(data, key, default=True):
+    v = data.get(key, default)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "t")
+    return bool(v)
+
+def _safe_float(x):
+    return float(N(sympify(str(x))))
+
 def _as_func(expr_str, var_name):
     x = Symbol(var_name)
     expr = sympify(expr_str, locals={"Abs": Abs})
     return x, expr, lambdify(x, expr, modules=['numpy'])
-
-def _round3(x):
-    return float(f"{float(x):.3f}")
-
-def _unique_sorted(vals):
-    # Deduplicate at 3 d.p. and sort
-    return sorted({_round3(v) for v in vals})
-
-def _safe_float(x):
-    return float(N(sympify(str(x))))
 
 def _scan_brackets(f_vec, a, b, steps):
     """
@@ -70,25 +72,38 @@ def _bisect_root(f_scalar, L, R):
         pass
     return None
 
+def _dedupe_sorted(vals, tol=1e-9):
+    """Sort and dedupe a list of floats without forcing rounding, using tolerance."""
+    vs = sorted(float(v) for v in vals)
+    out = []
+    for v in vs:
+        if not out or abs(v - out[-1]) > tol:
+            out.append(v)
+    return out
+
+# ---------------------- Health Check ----------------------
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({"status": "Calculator brain is online and ready!"})
+
 # ---------------------- Evaluate (numeric) ----------------------
 @app.route('/evaluate', methods=['POST'])
 def evaluate_expression_endpoint():
-    """Evaluates any mathematical expression to a single numerical value."""
     data = request.get_json()
     expression = data.get('expression')
     if not expression:
         return jsonify({"error": "Invalid request. Please provide an 'expression'."}), 400
+    round_final = _bool(data, "round_final", True)
     try:
         sympy_expr = sympify(expression, locals={"Abs": Abs})
-        final_result = _round3(N(sympy_expr, 50))
-        return jsonify({"result": str(final_result)})
+        val = float(N(sympy_expr, 50))
+        return jsonify({"result": str(_maybe_round(val, round_final))})
     except (SympifyError, TypeError, ValueError) as e:
         return jsonify({"error": f"Invalid mathematical expression provided: {str(e)}"}), 400
 
 # ---------------------- Differentiate (symbolic) ----------------------
 @app.route('/differentiate', methods=['POST'])
 def differentiate_expression():
-    """Finds the derivative of an expression with respect to a variable (symbolic)."""
     data = request.get_json()
     expression, variable = data.get('expression'), data.get('variable')
     if not all([expression, variable]):
@@ -101,10 +116,9 @@ def differentiate_expression():
     except (SympifyError, TypeError, ValueError):
         return jsonify({"error": "Could not differentiate the expression."}), 400
 
-# ---------------------- Integrate (indefinite) ----------------------
+# ---------------------- Integrate (indefinite, symbolic) ----------------------
 @app.route('/integrate', methods=['POST'])
 def integrate_expression():
-    """Finds the INDEFINITE integral of an expression using SymPy (symbolic)."""
     data = request.get_json()
     expression, variable = data.get('expression'), data.get('variable')
     if not all([expression, variable]):
@@ -120,8 +134,8 @@ def integrate_expression():
 # ---------------------- Definite Integral (numeric) ----------------------
 @app.route('/fnInt', methods=['POST'])
 def numerical_integrate():
-    """Numerically solve definite integrals via SciPy quad."""
     data = request.get_json()
+    round_final = _bool(data, "round_final", True)
     expression, variable = data.get('expression'), data.get('variable')
     lower_bound_str, upper_bound_str = data.get('lower_bound'), data.get('upper_bound')
     if not all([expression, variable, lower_bound_str, upper_bound_str]):
@@ -133,16 +147,15 @@ def numerical_integrate():
         sympy_expr = sympify(expression, locals={"Abs": Abs})
         f = lambdify(x, sympy_expr, modules=['numpy'])
         integral_result, _ = quad(f, lower_bound, upper_bound, limit=200)
-        return jsonify({"result": str(_round3(integral_result))})
+        return jsonify({"result": str(_maybe_round(integral_result, round_final))})
     except Exception as e:
-        print(f"A numerical integration error occurred in fnInt: {e}")
         return jsonify({"error": f"Numerical integration failed. {str(e)}"}), 400
 
 # ---------------------- Numeric Derivative at a point ----------------------
 @app.route('/nDeriv', methods=['POST'])
 def numerical_differentiate():
-    """Numerically evaluate the derivative at a point using numdifftools."""
     data = request.get_json()
+    round_final = _bool(data, "round_final", True)
     expression, variable, point = data.get('expression'), data.get('variable'), data.get('point')
     if not all([expression, variable, point]):
         return jsonify({"error": "Provide 'expression', 'variable', and 'point'."}), 400
@@ -151,17 +164,16 @@ def numerical_differentiate():
         x = Symbol(variable)
         sympy_expr = sympify(expression, locals={"Abs": Abs})
         f = lambdify(x, sympy_expr, modules=['numpy'])
-        derivative_result = nd.Derivative(lambda t: f(t))(x_val)
-        return jsonify({"result": str(_round3(derivative_result))})
+        dval = nd.Derivative(lambda t: f(t))(x_val)
+        return jsonify({"result": str(_maybe_round(dval, round_final))})
     except Exception as e:
-        print(f"A numerical differentiation error occurred in nDeriv: {e}")
-        return jsonify({"error": f"Numerical differentiation failed. {str(e)}"}), 400
+        return jsonify({"error": f"Numerical differentiation failed. {e}"}), 400
 
 # ---------------------- Zeros / Critical / Extrema / Inflection ----------------------
 @app.route('/zeros', methods=['POST'])
 def find_zeros():
-    """Roots of f(x) = 0 on [a,b]."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
     if not all([expr, var]) or a is None or b is None:
@@ -169,21 +181,23 @@ def find_zeros():
     try:
         a = _safe_float(a); b = _safe_float(b)
         x, _, f = _as_func(expr, var)
-        F_vec = lambda ts: f(ts)  # vectorized via numpy
+        F_vec = lambda ts: f(ts)
         brackets = _scan_brackets(F_vec, a, b, steps)
         roots = []
         for L, R in brackets:
             r = _bisect_root(lambda t: float(f(t)), L, R)
             if r is not None and a - 1e-12 <= r <= b + 1e-12:
                 roots.append(r)
-        return jsonify({"zeros": _unique_sorted(roots)})
+        roots = _dedupe_sorted(roots)
+        roots = [ _maybe_round(r, round_final) for r in roots ]
+        return jsonify({"zeros": roots})
     except Exception as e:
         return jsonify({"error": f"Zero-finding failed: {e}"}), 400
 
 @app.route('/critical', methods=['POST'])
 def critical_points():
-    """Roots of f'(x) on [a,b] (critical points)."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
     if not all([expr, var]) or a is None or b is None:
@@ -203,14 +217,16 @@ def critical_points():
             r = _bisect_root(fp_scalar, L, R)
             if r is not None and a - 1e-12 <= r <= b + 1e-12:
                 cps.append(r)
-        return jsonify({"critical_points": _unique_sorted(cps)})
+        cps = _dedupe_sorted(cps)
+        cps = [ _maybe_round(c, round_final) for c in cps ]
+        return jsonify({"critical_points": cps})
     except Exception as e:
         return jsonify({"error": f"Critical-point search failed: {e}"}), 400
 
 @app.route('/extrema', methods=['POST'])
 def extrema():
-    """Classify local minima/maxima from critical points and return f(x) values; include endpoints."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
     if not all([expr, var]) or a is None or b is None:
@@ -228,7 +244,7 @@ def extrema():
         for L, R in _scan_brackets(fp_vec, a, b, steps):
             r = _bisect_root(fp_scalar, L, R)
             if r is not None: cps_raw.append(r)
-        cps = _unique_sorted(cps_raw)
+        cps = _dedupe_sorted(cps_raw)
 
         results = []
         for xc in cps:
@@ -241,18 +257,20 @@ def extrema():
                 kind = "local_min"
             else:
                 kind = "neither"
-            results.append({"x": _round3(xc), "type": kind, "f": _round3(f(xc))})
+            results.append({"x": _maybe_round(xc, round_final),
+                            "type": kind,
+                            "f": _maybe_round(f(xc), round_final)})
 
-        return jsonify({"extrema": results,
-                        "endpoints": [{"x": _round3(a), "f": _round3(f(a))},
-                                      {"x": _round3(b), "f": _round3(f(b))}]})
+        endpoints = [{"x": _maybe_round(a, round_final), "f": _maybe_round(f(a), round_final)},
+                     {"x": _maybe_round(b, round_final), "f": _maybe_round(f(b), round_final)}]
+        return jsonify({"extrema": results, "endpoints": endpoints})
     except Exception as e:
         return jsonify({"error": f"Extrema classification failed: {e}"}), 400
 
 @app.route('/inflection', methods=['POST'])
 def inflection_points():
-    """Inflection points where f'' changes sign on [a,b]."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
     if not all([expr, var]) or a is None or b is None:
@@ -272,25 +290,22 @@ def inflection_points():
             if r is not None:
                 candidates.append(r)
 
-        points = []
-        for xc in _unique_sorted(candidates):
+        pts = []
+        for xc in _dedupe_sorted(candidates):
             eps = 1e-3
             left = fpp_scalar(xc - eps)
             right = fpp_scalar(xc + eps)
             if left * right < 0:
-                points.append(_round3(xc))
-        return jsonify({"inflection_points": points})
+                pts.append(_maybe_round(xc, round_final))
+        return jsonify({"inflection_points": pts})
     except Exception as e:
         return jsonify({"error": f"Inflection search failed: {e}"}), 400
 
 # ---------------------- Cartesian Intersections ----------------------
 @app.route('/intersections', methods=['POST'])
 def intersections():
-    """
-    Cartesian intersections of f and g on [a,b]: solve f(x)=g(x).
-    Returns x-values and corresponding y-values.
-    """
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     ef, eg, var, a, b = d.get('expression_f'), d.get('expression_g'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 600))
     if not all([ef, eg, var]) or a is None or b is None:
@@ -309,8 +324,9 @@ def intersections():
             if r is not None and a - 1e-12 <= r <= b + 1e-12:
                 xs.append(r)
 
-        xs = _unique_sorted(xs)
-        pts = [{"x": _round3(t), "y": _round3(f(t))} for t in xs]
+        xs = _dedupe_sorted(xs)
+        pts = [{"x": _maybe_round(t, round_final), "y": _maybe_round(f(t), round_final)} for t in xs]
+        xs = [ _maybe_round(t, round_final) for t in xs ]
         return jsonify({"x": xs, "points": pts})
     except Exception as e:
         return jsonify({"error": f"Intersections failed: {e}"}), 400
@@ -318,10 +334,8 @@ def intersections():
 # ---------------------- Areas: Between Curves ----------------------
 @app.route('/areaBetween', methods=['POST'])
 def area_between():
-    """
-    Area between f and g on [a,b]: ∫_a^b |f-g| dx, partitioned at crossings of f-g.
-    """
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     ef, eg, var, a, b = d.get('expression_f'), d.get('expression_g'), d.get('variable'), d.get('a'), d.get('b')
     if not all([ef, eg, var]) or a is None or b is None:
         return jsonify({"error":"Provide 'expression_f','expression_g','variable','a','b'."}), 400
@@ -332,23 +346,22 @@ def area_between():
         H = lambda t: f(t) - g(t)
         F_vec = lambda ts: H(ts)
         brackets = _scan_brackets(F_vec, a, b, 600)
-        # Build partition points (a, any bracket endpoints, b)
         pts = [a] + [pt for pair in brackets for pt in pair if a < pt < b] + [b]
-        pts = sorted(list({round(p, 10) for p in pts}))
+        pts = sorted(list({round(p, 12) for p in pts}))
         total = 0.0
         for L, R in zip(pts[:-1], pts[1:]):
             integrand = lambda t: np.abs(H(t))
             val, _ = quad(integrand, L, R, limit=200)
             total += val
-        return jsonify({"result": str(_round3(total))})
+        return jsonify({"result": str(_maybe_round(total, round_final))})
     except Exception as e:
         return jsonify({"error": f"Area between curves failed: {e}"}), 400
 
 # ---------------------- Tabular Calculus ----------------------
 @app.route('/tabularIntegral', methods=['POST'])
 def tabular_integral():
-    """Trapezoidal approximation from (x[], y[])."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     xs, ys = d.get('x'), d.get('y')
     if xs is None or ys is None or len(xs) != len(ys) or len(xs) < 2:
         return jsonify({"error":"Provide arrays 'x' and 'y' of equal length ≥ 2."}), 400
@@ -359,14 +372,14 @@ def tabular_integral():
         for i in range(len(xs)-1):
             h = xs[i+1] - xs[i]
             area += 0.5 * h * (ys[i] + ys[i+1])
-        return jsonify({"result": str(_round3(area))})
+        return jsonify({"result": str(_maybe_round(area, round_final))})
     except Exception as e:
         return jsonify({"error": f"Tabular integral failed: {e}"}), 400
 
 @app.route('/tabularDerivative', methods=['POST'])
 def tabular_derivative():
-    """Estimate f'(x0) from table via nearest central/one-sided difference."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     xs, ys, x0 = d.get('x'), d.get('y'), d.get('x0')
     if xs is None or ys is None or x0 is None:
         return jsonify({"error":"Provide 'x','y','x0'."}), 400
@@ -381,7 +394,7 @@ def tabular_derivative():
             der = (ys[1] - ys[0]) / (xs[1] - xs[0])
         else:
             der = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
-        return jsonify({"result": str(_round3(der))})
+        return jsonify({"result": str(_maybe_round(der, round_final))})
     except Exception as e:
         return jsonify({"error": f"Tabular derivative failed: {e}"}), 400
 
@@ -390,9 +403,10 @@ def tabular_derivative():
 def euler_method_endpoint():
     """
     Euler's method for dy/dx = f(x,y).
-    JSON: { "fxy": "x - y", "x0":0, "y0":1, "h":0.2, "n":5 }
+    JSON: { "fxy": "x - y", "x0":0, "y0":1, "h":0.2, "n":5, "round_final":false }
     """
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     fxy, x0, y0, h, n = d.get('fxy'), d.get('x0'), d.get('y0'), d.get('h'), d.get('n')
     if not all([fxy is not None, x0 is not None, y0 is not None, h is not None, n is not None]):
         return jsonify({"error":"Provide 'fxy','x0','y0','h','n'."}), 400
@@ -401,20 +415,20 @@ def euler_method_endpoint():
         f_expr = sympify(fxy, locals={"Abs": Abs})
         f = lambdify((x_sym, y_sym), f_expr, modules=['numpy'])
         x = _safe_float(x0); y = _safe_float(y0); h = _safe_float(h); n = int(n)
-        pts = [{"x": _round3(x), "y": _round3(y)}]
+        pts = [{"x": _maybe_round(x, round_final), "y": _maybe_round(y, round_final)}]
         for _ in range(n):
             y = y + h * float(f(x, y))
             x = x + h
-            pts.append({"x": _round3(x), "y": _round3(y)})
-        return jsonify({"points": pts, "y_n": _round3(y)})
+            pts.append({"x": _maybe_round(x, round_final), "y": _maybe_round(y, round_final)})
+        return jsonify({"points": pts, "y_n": _maybe_round(y, round_final)})
     except Exception as e:
         return jsonify({"error": f"Euler failed: {e}"}), 400
 
 # ---------------------- Motion: position & total distance ----------------------
 @app.route('/positionFromVelocity', methods=['POST'])
 def position_from_velocity():
-    """s(t) = s0 + ∫_a^b v(t) dt"""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     v, var, a, b, s0 = d.get('v'), d.get('variable'), d.get('a'), d.get('b'), d.get('s0', 0)
     if not all([v, var]) or a is None or b is None:
         return jsonify({"error":"Provide 'v','variable','a','b' (and optional 's0')."}), 400
@@ -422,14 +436,14 @@ def position_from_velocity():
         a = _safe_float(a); b = _safe_float(b); s0 = _safe_float(s0)
         x, _, vf = _as_func(v, var)
         val, _ = quad(vf, a, b, limit=200)
-        return jsonify({"result": str(_round3(s0 + val))})
+        return jsonify({"result": str(_maybe_round(s0 + val, round_final))})
     except Exception as e:
         return jsonify({"error": f"positionFromVelocity failed: {e}"}), 400
 
 @app.route('/totalDistance', methods=['POST'])
 def total_distance():
-    """∫_a^b |v(t)| dt"""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     v, var, a, b = d.get('v'), d.get('variable'), d.get('a'), d.get('b')
     if not all([v, var]) or a is None or b is None:
         return jsonify({"error":"Provide 'v','variable','a','b'."}), 400
@@ -438,15 +452,15 @@ def total_distance():
         x, _, vf = _as_func(v, var)
         abs_v = lambda t: np.abs(vf(t))
         val, _ = quad(abs_v, a, b, limit=200)
-        return jsonify({"result": str(_round3(val))})
+        return jsonify({"result": str(_maybe_round(val, round_final))})
     except Exception as e:
         return jsonify({"error": f"totalDistance failed: {e}"}), 400
 
 # ---------------------- Parametric & Polar (BC) ----------------------
 @app.route('/parametricSlope', methods=['POST'])
 def parametric_slope():
-    """dy/dx = (dy/dt)/(dx/dt) at a given t."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     xt, yt, t0 = d.get('x_t'), d.get('y_t'), d.get('t')
     if not all([xt, yt, t0 is not None]):
         return jsonify({"error":"Provide 'x_t','y_t','t'."}), 400
@@ -457,14 +471,14 @@ def parametric_slope():
         dxdt = lambdify(T, diff(xexpr, T), modules=['numpy'])
         dydt = lambdify(T, diff(yexpr, T), modules=['numpy'])
         slope = float(dydt(t0)) / float(dxdt(t0))
-        return jsonify({"result": str(_round3(slope))})
+        return jsonify({"result": str(_maybe_round(slope, round_final))})
     except Exception as e:
         return jsonify({"error": f"parametricSlope failed: {e}"}), 400
 
 @app.route('/parametricArcLength', methods=['POST'])
 def parametric_arc_length():
-    """∫_a^b sqrt((dx/dt)^2 + (dy/dt)^2) dt"""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     xt, yt, a, b = d.get('x_t'), d.get('y_t'), d.get('a'), d.get('b')
     if not all([xt, yt]) or a is None or b is None:
         return jsonify({"error":"Provide 'x_t','y_t','a','b'."}), 400
@@ -476,14 +490,14 @@ def parametric_arc_length():
         dyt = lambdify(T, diff(yexpr, T), modules=['numpy'])
         integrand = lambda t: np.sqrt(dxt(t)**2 + dyt(t)**2)
         val, _ = quad(integrand, a, b, limit=200)
-        return jsonify({"result": str(_round3(val))})
+        return jsonify({"result": str(_maybe_round(val, round_final))})
     except Exception as e:
         return jsonify({"error": f"parametricArcLength failed: {e}"}), 400
 
 @app.route('/polarArea', methods=['POST'])
 def polar_area():
-    """(1/2) ∫ r(θ)^2 dθ on [a,b]."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     r, a, b = d.get('r'), d.get('a'), d.get('b')
     if r is None or a is None or b is None:
         return jsonify({"error":"Provide 'r','a','b'."}), 400
@@ -494,14 +508,14 @@ def polar_area():
         rf = lambdify(th, rexpr, modules=['numpy'])
         integrand = lambda t: 0.5 * (rf(t)**2)
         val, _ = quad(integrand, a, b, limit=200)
-        return jsonify({"result": str(_round3(val))})
+        return jsonify({"result": str(_maybe_round(val, round_final))})
     except Exception as e:
         return jsonify({"error": f"polarArea failed: {e}"}), 400
 
 @app.route('/polarIntersections', methods=['POST'])
 def polar_intersections():
-    """Solve r1(θ) = r2(θ) on [a,b]; returns θ values."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     r1, r2, a, b = d.get('r1'), d.get('r2'), d.get('a'), d.get('b')
     if not all([r1, r2]) or a is None or b is None:
         return jsonify({"error":"Provide 'r1','r2','a','b'."}), 400
@@ -518,15 +532,17 @@ def polar_intersections():
             r = _bisect_root(lambda t: float(F(t)), L, R)
             if r is not None:
                 roots.append(r)
-        return jsonify({"thetas": _unique_sorted(roots)})
+        roots = _dedupe_sorted(roots)
+        roots = [ _maybe_round(r, round_final) for r in roots ]
+        return jsonify({"thetas": roots})
     except Exception as e:
         return jsonify({"error": f"polarIntersections failed: {e}"}), 400
 
 # ---------------------- Series & Taylor (BC) ----------------------
 @app.route('/partialSum', methods=['POST'])
 def partial_sum():
-    """Compute S_n = sum_{k=1..n} a(k)."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     a_n, n, idx = d.get('a_n'), d.get('n'), d.get('index', 'n')
     if a_n is None or n is None:
         return jsonify({"error":"Provide 'a_n' and 'n'."}), 400
@@ -538,14 +554,14 @@ def partial_sum():
         s = 0.0
         for i in range(1, n + 1):
             s += float(f(i))
-        return jsonify({"result": str(_round3(s))})
+        return jsonify({"result": str(_maybe_round(s, round_final))})
     except Exception as e:
         return jsonify({"error": f"partialSum failed: {e}"}), 400
 
 @app.route('/altSeriesError', methods=['POST'])
 def alternating_series_error():
-    """Alternating Series Error Bound ≈ |a_{n+1}|."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     a_n, n, idx = d.get('a_n'), d.get('n'), d.get('index', 'n')
     if a_n is None or n is None:
         return jsonify({"error":"Provide 'a_n' and 'n'."}), 400
@@ -555,13 +571,12 @@ def alternating_series_error():
         term = sympify(a_n, locals={"Abs": Abs})
         f = lambdify(k, term, modules=['numpy'])
         err = abs(float(f(n + 1)))
-        return jsonify({"error_bound": str(_round3(err))})
+        return jsonify({"error_bound": str(_maybe_round(err, round_final))})
     except Exception as e:
         return jsonify({"error": f"altSeriesError failed: {e}"}), 400
 
 @app.route('/taylorPoly', methods=['POST'])
 def taylor_poly():
-    """Return Taylor polynomial of order n around x0 (symbolic)."""
     d = request.get_json()
     fstr, var, x0, n = d.get('f'), d.get('variable'), d.get('x0'), d.get('n')
     if not all([fstr, var, x0 is not None, n is not None]):
@@ -577,8 +592,8 @@ def taylor_poly():
 
 @app.route('/taylorApprox', methods=['POST'])
 def taylor_approx():
-    """Evaluate Taylor polynomial of order n for f at x_eval."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     fstr, var, x0, n, xe = d.get('f'), d.get('variable'), d.get('x0'), d.get('n'), d.get('x_eval')
     if not all([fstr, var, x0 is not None, n is not None, xe is not None]):
         return jsonify({"error":"Provide 'f','variable','x0','n','x_eval'."}), 400
@@ -588,42 +603,43 @@ def taylor_approx():
         f = sympify(fstr, locals={"Abs": Abs})
         poly = f.series(x, x0, n + 1).removeO()
         pfunc = lambdify(x, poly, modules=['numpy'])
-        return jsonify({"result": str(_round3(pfunc(xe)))})
+        val = pfunc(xe)
+        return jsonify({"result": str(_maybe_round(val, round_final))})
     except Exception as e:
         return jsonify({"error": f"taylorApprox failed: {e}"}), 400
 
 # ---------------------- Logistic / Exponential + solver ----------------------
 @app.route('/logistic', methods=['POST'])
 def logistic_value():
-    """P(t) for dP/dt = kP(1 - P/L), given P0 at t=0."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     P0, k, L, t = d.get('P0'), d.get('k'), d.get('L'), d.get('t')
     if not all([P0, k, L, t]):
         return jsonify({"error":"Provide 'P0','k','L','t'."}), 400
     try:
         P0 = _safe_float(P0); k = _safe_float(k); L = _safe_float(L); t = _safe_float(t)
         val = L / (1 + ((L - P0) / P0) * np.exp(-k * t))
-        return jsonify({"result": str(_round3(val))})
+        return jsonify({"result": str(_maybe_round(val, round_final))})
     except Exception as e:
         return jsonify({"error": f"logistic failed: {e}"}), 400
 
 @app.route('/expGrowth', methods=['POST'])
 def exponential_value():
-    """P(t) = P0 * e^{k t}."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     P0, k, t = d.get('P0'), d.get('k'), d.get('t')
     if not all([P0, k, t]):
         return jsonify({"error":"Provide 'P0','k','t'."}), 400
     try:
         P0 = _safe_float(P0); k = _safe_float(k); t = _safe_float(t)
-        return jsonify({"result": str(_round3(P0 * np.exp(k * t)))})
+        return jsonify({"result": str(_maybe_round(P0 * np.exp(k * t), round_final))})
     except Exception as e:
         return jsonify({"error": f"expGrowth failed: {e}"}), 400
 
 @app.route('/solveForT', methods=['POST'])
 def solve_for_t():
-    """Solve f(t) = target on [a,b]; return t."""
     d = request.get_json()
+    round_final = _bool(d, "round_final", True)
     fstr, a, b, target = d.get('f_t'), d.get('a'), d.get('b'), d.get('target')
     if not all([fstr]) or a is None or b is None or target is None:
         return jsonify({"error":"Provide 'f_t','a','b','target'."}), 400
@@ -637,7 +653,7 @@ def solve_for_t():
         for L, R in brackets:
             root = _bisect_root(F, L, R)
             if root is not None:
-                return jsonify({"t": str(_round3(root))})
+                return jsonify({"t": str(_maybe_round(root, round_final))})
         return jsonify({"error":"No solution in interval."}), 400
     except Exception as e:
         return jsonify({"error": f"solveForT failed: {e}"}), 400
