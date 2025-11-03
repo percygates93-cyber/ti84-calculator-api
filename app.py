@@ -1,12 +1,12 @@
 # Bzzzt! This is the final, production-grade code for your calculator brain.
 # SymPy for symbolic work; SciPy / NumPy / numdifftools for numerical precision.
-# VERSION 4.1 – AP Calc AB/BC Complete + round_final toggle
+# VERSION 4.2 – AP Calc AB/BC + Precalc Regressions + round_final toggle
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sympy import sympify, N, SympifyError, diff, integrate, Symbol, Abs, lambdify
 from scipy.integrate import quad
-from scipy.optimize import root_scalar
+from scipy.optimize import root_scalar, curve_fit
 import numpy as np
 import numdifftools as nd  # High-precision numerical derivatives
 
@@ -205,12 +205,8 @@ def critical_points():
     try:
         a = _safe_float(a); b = _safe_float(b)
         x, _, f = _as_func(expr, var)
-
-        def fp_scalar(t):
-            return float(nd.Derivative(lambda s: f(s))(t))
-        def fp_vec(ts):
-            return np.array([fp_scalar(t) for t in np.atleast_1d(ts)])
-
+        def fp_scalar(t): return float(nd.Derivative(lambda s: f(s))(t))
+        def fp_vec(ts): return np.array([fp_scalar(t) for t in np.atleast_1d(ts)])
         brackets = _scan_brackets(fp_vec, a, b, steps)
         cps = []
         for L, R in brackets:
@@ -234,18 +230,13 @@ def extrema():
     try:
         a = _safe_float(a); b = _safe_float(b)
         x, _, f = _as_func(expr, var)
-
-        def fp_scalar(t):
-            return float(nd.Derivative(lambda s: f(s))(t))
-        def fp_vec(ts):
-            return np.array([fp_scalar(t) for t in np.atleast_1d(ts)])
-
+        def fp_scalar(t): return float(nd.Derivative(lambda s: f(s))(t))
+        def fp_vec(ts): return np.array([fp_scalar(t) for t in np.atleast_1d(ts)])
         cps_raw = []
         for L, R in _scan_brackets(fp_vec, a, b, steps):
             r = _bisect_root(fp_scalar, L, R)
             if r is not None: cps_raw.append(r)
         cps = _dedupe_sorted(cps_raw)
-
         results = []
         for xc in cps:
             eps = 1e-3
@@ -260,7 +251,6 @@ def extrema():
             results.append({"x": _maybe_round(xc, round_final),
                             "type": kind,
                             "f": _maybe_round(f(xc), round_final)})
-
         endpoints = [{"x": _maybe_round(a, round_final), "f": _maybe_round(f(a), round_final)},
                      {"x": _maybe_round(b, round_final), "f": _maybe_round(f(b), round_final)}]
         return jsonify({"extrema": results, "endpoints": endpoints})
@@ -278,18 +268,13 @@ def inflection_points():
     try:
         a = _safe_float(a); b = _safe_float(b)
         x, _, f = _as_func(expr, var)
-
-        def fpp_scalar(t):
-            return float(nd.Derivative(lambda s: f(s), n=2)(t))
-        def fpp_vec(ts):
-            return np.array([fpp_scalar(t) for t in np.atleast_1d(ts)])
-
+        def fpp_scalar(t): return float(nd.Derivative(lambda s: f(s), n=2)(t))
+        def fpp_vec(ts): return np.array([fpp_scalar(t) for t in np.atleast_1d(ts)])
         candidates = []
         for L, R in _scan_brackets(fpp_vec, a, b, steps):
             r = _bisect_root(fpp_scalar, L, R)
             if r is not None:
                 candidates.append(r)
-
         pts = []
         for xc in _dedupe_sorted(candidates):
             eps = 1e-3
@@ -314,16 +299,13 @@ def intersections():
         a = _safe_float(a); b = _safe_float(b)
         x, _, f = _as_func(ef, var)
         _, _, g = _as_func(eg, var)
-
         F_vec = lambda ts: f(ts) - g(ts)
         brackets = _scan_brackets(F_vec, a, b, steps)
-
         xs = []
         for L, R in brackets:
             r = _bisect_root(lambda t: float(f(t) - g(t)), L, R)
             if r is not None and a - 1e-12 <= r <= b + 1e-12:
                 xs.append(r)
-
         xs = _dedupe_sorted(xs)
         pts = [{"x": _maybe_round(t, round_final), "y": _maybe_round(f(t), round_final)} for t in xs]
         xs = [ _maybe_round(t, round_final) for t in xs ]
@@ -657,6 +639,69 @@ def solve_for_t():
         return jsonify({"error":"No solution in interval."}), 400
     except Exception as e:
         return jsonify({"error": f"solveForT failed: {e}"}), 400
+
+# ---------------------- Precalculus: Regressions ----------------------
+@app.route('/regress', methods=['POST'])
+def regression_fit():
+    """
+    Regression fit for model ∈ {linear, quadratic, cubic, quartic, exp, log, power, sinusoidal}.
+    JSON: {"model":"quadratic","x":[...],"y":[...],"round_final":true}
+    Returns: {"model":..., "params":[...], "R2":...}
+    """
+    d = request.get_json()
+    model = d.get('model')
+    x = d.get('x')
+    y = d.get('y')
+    round_final = _bool(d, "round_final", True)
+
+    if x is None or y is None or model is None:
+        return jsonify({"error":"Provide 'model','x','y'."}), 400
+
+    try:
+        x = np.array(x, dtype=float)
+        y = np.array(y, dtype=float)
+
+        # Model definitions
+        def linear(x,a,b): return a*x+b
+        def quadratic(x,a,b,c): return a*x**2+b*x+c
+        def cubic(x,a,b,c,d): return a*x**3+b*x**2+c*x+d
+        def quartic(x,a,b,c,d,e): return a*x**4+b*x**3+c*x**2+d*x+e
+        def exponential(x,a,b): return a*np.power(b, x)
+        def logarithmic(x,a,b): return a*np.log(x)+b
+        def power(x,a,b): return a*np.power(x, b)
+        def sinusoidal(x,A,B,C,D): return A*np.sin(B*x + C) + D
+
+        models = {
+            "linear":      (linear,      [1.0, 0.0]),
+            "quadratic":   (quadratic,   [1.0, 0.0, 0.0]),
+            "cubic":       (cubic,       [1.0, 0.0, 0.0, 0.0]),
+            "quartic":     (quartic,     [1.0, 0.0, 0.0, 0.0, 0.0]),
+            "exp":         (exponential, [1.0, 1.1]),
+            "log":         (logarithmic, [1.0, 0.0]),
+            "power":       (power,       [1.0, 1.0]),
+            "sinusoidal":  (sinusoidal,  [1.0, 1.0, 0.0, 0.0])
+        }
+        if model not in models:
+            return jsonify({"error":"Invalid model type. Use linear/quadratic/cubic/quartic/exp/log/power/sinusoidal."}), 400
+
+        func, p0 = models[model]
+
+        # Domain guards for log/power models
+        if model in ("log", "power"):
+            if np.any(x <= 0):
+                return jsonify({"error":"log/ power regression requires x > 0."}), 400
+
+        popt, _ = curve_fit(func, x, y, p0=p0, maxfev=10000)
+        y_pred = func(x, *popt)
+        ss_res = np.sum((y - y_pred)**2)
+        ss_tot = np.sum((y - np.mean(y))**2)
+        r2 = 1.0 - (ss_res / ss_tot if ss_tot != 0 else 0.0)
+
+        params = [ _maybe_round(v, round_final) for v in popt ]
+        return jsonify({"model": model, "params": params, "R2": _maybe_round(r2, round_final)})
+
+    except Exception as e:
+        return jsonify({"error": f"Regression failed: {e}"}), 400
 
 # ---------------------- Run ----------------------
 if __name__ == '__main__':
