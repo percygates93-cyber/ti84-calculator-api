@@ -730,26 +730,73 @@ def regression_fit():
             params = [ _maybe_round(a, round_final), _maybe_round(b, round_final) ]
 
         elif model == "sinusoidal":
-            # y ≈ A sin(Bx + C) + D ; robust init using FFT-ish heuristics
-            def sin_model(xx, A,B,C,D): return A*np.sin(B*xx + C) + D
-            # Initial guesses
-            A0 = 0.5*(np.max(y)-np.min(y)) if np.ptp(y)>0 else 1.0
-            # freq guess from zero crossings (fallback to 2π/period≈ range-based)
-            period_guess = (x[-1]-x[0])/2 if (x[-1]-x[0])>0 else 2*np.pi
-            B0 = 2*np.pi/period_guess
-            C0 = 0.0
-            D0 = np.mean(y)
-            p0 = [A0, B0, C0, D0]
-            bounds = ([-np.inf, 0, -2*np.pi, -np.inf], [np.inf, np.inf, 2*np.pi, np.inf])
-            popt, _ = curve_fit(sin_model, x, y, p0=p0, bounds=bounds, maxfev=20000)
-            y_pred = sin_model(x, *popt)
-            R2 = r2_score(y, y_pred)
-            params = [ _maybe_round(v, round_final) for v in popt ]
+    # y ≈ A sin(ωx) + B cos(ωx) + D  (linear in A,B,D for fixed ω)
+    x_span = (np.max(x) - np.min(x)) if len(x) > 1 else 1.0
 
-        else:
-            return jsonify({"error":"Unhandled model."}), 400
+    # Frequency search range (radians per x-unit). Sensible defaults:
+    # min period ~ 0.5 * span, max period ~ 4 * span  → tune as needed
+    # Allow user hints if provided
+    w_min = float(d.get("w_min", 2*np.pi / (4.0 * x_span + 1e-9)))
+    w_max = float(d.get("w_max", 2*np.pi / (0.5 * x_span + 1e-9)))
+    if w_max < w_min:  # swap if user passed reversed
+        w_min, w_max = w_max, w_min
 
-        return jsonify({"model": model, "params": params, "R2": _maybe_round(R2, round_final)})
+    # Optional period hint (overrides center of the range)
+    period_hint = d.get("period_guess", None)
+    if period_hint is not None:
+        try:
+            w_hint = 2*np.pi / float(period_hint)
+            w_min = min(w_min, w_hint*2)   # widen around hint
+            w_max = max(w_max, w_hint/2)
+        except Exception:
+            pass
+
+    def fit_for_omega(omega):
+        # Design matrix: [sin(ωx), cos(ωx), 1]
+        S = np.sin(omega * x)
+        Cc = np.cos(omega * x)
+        M = np.column_stack([S, Cc, np.ones_like(x)])
+        # Solve least squares for A, B, D
+        coef, *_ = np.linalg.lstsq(M, y, rcond=None)
+        A_hat, B_hat, D_hat = coef
+        y_pred = A_hat*S + B_hat*Cc + D_hat
+        ss_res = np.sum((y - y_pred)**2)
+        ss_tot = np.sum((y - np.mean(y))**2)
+        R2 = 1.0 - (ss_res/ss_tot if ss_tot != 0 else 0.0)
+        return R2, A_hat, B_hat, D_hat
+
+    # Coarse-to-fine sweep for ω
+    ws = np.linspace(w_min, w_max, 300)
+    best = (-np.inf, None, None, None, None)  # (R2, ω, A, B, D)
+    for w in ws:
+        R2w, A, B, D = fit_for_omega(w)
+        if R2w > best[0]:
+            best = (R2w, w, A, B, D)
+
+    # Local refinement around the winner
+    R2_best, w_best, A_best, B_best, D_best = best
+    w_lo = max(w_min, w_best*0.9)
+    w_hi = min(w_max, w_best*1.1)
+    ws2 = np.linspace(w_lo, w_hi, 120)
+    for w in ws2:
+        R2w, A, B, D = fit_for_omega(w)
+        if R2w > R2_best:
+            R2_best, w_best, A_best, B_best, D_best = R2w, w, A, B, D
+
+    # Convert to A*sin(Bx + C) + D form (rename: amp, freq=B, phase=C)
+    amp = float(np.hypot(A_best, B_best))
+    phase = float(np.arctan2(B_best, A_best))
+    freq = float(w_best)
+    offset = float(D_best)
+
+    params = [
+        _maybe_round(amp, round_final),
+        _maybe_round(freq, round_final),
+        _maybe_round(phase, round_final),
+        _maybe_round(offset, round_final)
+    ]
+    return jsonify({"model": "sinusoidal", "params": params, "R2": _maybe_round(R2_best, round_final)})
+
 
     except Exception as e:
         return jsonify({"error": f"Regression failed: {e}"}), 400
