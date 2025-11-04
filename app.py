@@ -648,60 +648,112 @@ def regression_fit():
     JSON: {"model":"quadratic","x":[...],"y":[...],"round_final":true}
     Returns: {"model":..., "params":[...], "R2":...}
     """
+    from scipy.optimize import curve_fit
     d = request.get_json()
-    model = d.get('model')
-    x = d.get('x')
-    y = d.get('y')
+    model_in = (d.get('model') or "").strip().lower()
+    x = d.get('x'); y = d.get('y')
     round_final = _bool(d, "round_final", True)
 
-    if x is None or y is None or model is None:
-        return jsonify({"error":"Provide 'model','x','y'."}), 400
+    if x is None or y is None or not len(x) or not len(y):
+        return jsonify({"error":"Provide 'model','x','y' arrays."}), 400
+
+    # ---- Accept common synonyms so Percy never mislabels
+    alias = {
+        "linear":"linear", "lin":"linear",
+        "quadratic":"quadratic", "quad":"quadratic",
+        "cubic":"cubic",
+        "quartic":"quartic", "4th":"quartic", "degree4":"quartic",
+        "exp":"exp", "exponential":"exp",
+        "log":"log", "logarithmic":"log",
+        "power":"power", "powerlaw":"power",
+        "sin":"sinusoidal", "sine":"sinusoidal", "sinusoidal":"sinusoidal"
+    }
+    model = alias.get(model_in)
+    if model is None:
+        return jsonify({"error":"Invalid model. Use linear/quadratic/cubic/quartic/exp/log/power/sinusoidal."}), 400
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    # R² helper
+    def r2_score(y_true, y_pred):
+        ss_res = np.sum((y_true - y_pred)**2)
+        ss_tot = np.sum((y_true - np.mean(y_true))**2)
+        return 1.0 - (ss_res/ss_tot if ss_tot != 0 else 0.0)
 
     try:
-        x = np.array(x, dtype=float)
-        y = np.array(y, dtype=float)
+        if model in ("linear","quadratic","cubic","quartic"):
+            deg = {"linear":1,"quadratic":2,"cubic":3,"quartic":4}[model]
+            # Center/scale x to improve conditioning for high degree
+            x_mu, x_sigma = np.mean(x), np.std(x) if np.std(x)>0 else 1.0
+            Xn = (x - x_mu)/x_sigma
+            coeffs_n = np.polyfit(Xn, y, deg=deg)
+            # Convert back to standard basis ax^n + ...
+            # Build Vandermonde to map normalized poly to original x
+            # Easiest: evaluate poly on x grid and re-fit in original basis with polyfit deg.
+            y_hat = np.polyval(coeffs_n, Xn)
+            coeffs = np.polyfit(x, y_hat, deg=deg)
+            y_pred = np.polyval(coeffs, x)
+            R2 = r2_score(y, y_pred)
+            params = [ _maybe_round(c, round_final) for c in coeffs ]  # a..e (highest degree first)
 
-        # Model definitions
-        def linear(x,a,b): return a*x+b
-        def quadratic(x,a,b,c): return a*x**2+b*x+c
-        def cubic(x,a,b,c,d): return a*x**3+b*x**2+c*x+d
-        def quartic(x,a,b,c,d,e): return a*x**4+b*x**3+c*x**2+d*x+e
-        def exponential(x,a,b): return a*np.power(b, x)
-        def logarithmic(x,a,b): return a*np.log(x)+b
-        def power(x,a,b): return a*np.power(x, b)
-        def sinusoidal(x,A,B,C,D): return A*np.sin(B*x + C) + D
+        elif model == "exp":
+            # y = a * b^x, require y>0
+            if np.any(y <= 0):
+                return jsonify({"error":"Exponential regression requires y > 0."}), 400
+            Y = np.log(y)
+            B, A = np.polyfit(x, Y, 1)  # Y = A + B x
+            a = np.exp(A); b = np.exp(B)
+            y_pred = a * np.power(b, x)
+            R2 = r2_score(y, y_pred)
+            params = [ _maybe_round(a, round_final), _maybe_round(b, round_final) ]
 
-        models = {
-            "linear":      (linear,      [1.0, 0.0]),
-            "quadratic":   (quadratic,   [1.0, 0.0, 0.0]),
-            "cubic":       (cubic,       [1.0, 0.0, 0.0, 0.0]),
-            "quartic":     (quartic,     [1.0, 0.0, 0.0, 0.0, 0.0]),
-            "exp":         (exponential, [1.0, 1.1]),
-            "log":         (logarithmic, [1.0, 0.0]),
-            "power":       (power,       [1.0, 1.0]),
-            "sinusoidal":  (sinusoidal,  [1.0, 1.0, 0.0, 0.0])
-        }
-        if model not in models:
-            return jsonify({"error":"Invalid model type. Use linear/quadratic/cubic/quartic/exp/log/power/sinusoidal."}), 400
-
-        func, p0 = models[model]
-
-        # Domain guards for log/power models
-        if model in ("log", "power"):
+        elif model == "log":
+            # y = a ln x + b, require x>0
             if np.any(x <= 0):
-                return jsonify({"error":"log/ power regression requires x > 0."}), 400
+                return jsonify({"error":"Logarithmic regression requires x > 0."}), 400
+            Lx = np.log(x)
+            a, b = np.polyfit(Lx, y, 1)
+            y_pred = a*Lx + b
+            R2 = r2_score(y, y_pred)
+            params = [ _maybe_round(a, round_final), _maybe_round(b, round_final) ]
 
-        popt, _ = curve_fit(func, x, y, p0=p0, maxfev=10000)
-        y_pred = func(x, *popt)
-        ss_res = np.sum((y - y_pred)**2)
-        ss_tot = np.sum((y - np.mean(y))**2)
-        r2 = 1.0 - (ss_res / ss_tot if ss_tot != 0 else 0.0)
+        elif model == "power":
+            # y = a x^b, require x>0, y>0
+            if np.any(x <= 0) or np.any(y <= 0):
+                return jsonify({"error":"Power regression requires x > 0 and y > 0."}), 400
+            Lx, Ly = np.log(x), np.log(y)
+            b, ln_a = np.polyfit(Lx, Ly, 1)
+            a = np.exp(ln_a)
+            y_pred = a * np.power(x, b)
+            R2 = r2_score(y, y_pred)
+            params = [ _maybe_round(a, round_final), _maybe_round(b, round_final) ]
 
-        params = [ _maybe_round(v, round_final) for v in popt ]
-        return jsonify({"model": model, "params": params, "R2": _maybe_round(r2, round_final)})
+        elif model == "sinusoidal":
+            # y ≈ A sin(Bx + C) + D ; robust init using FFT-ish heuristics
+            def sin_model(xx, A,B,C,D): return A*np.sin(B*xx + C) + D
+            # Initial guesses
+            A0 = 0.5*(np.max(y)-np.min(y)) if np.ptp(y)>0 else 1.0
+            # freq guess from zero crossings (fallback to 2π/period≈ range-based)
+            period_guess = (x[-1]-x[0])/2 if (x[-1]-x[0])>0 else 2*np.pi
+            B0 = 2*np.pi/period_guess
+            C0 = 0.0
+            D0 = np.mean(y)
+            p0 = [A0, B0, C0, D0]
+            bounds = ([-np.inf, 0, -2*np.pi, -np.inf], [np.inf, np.inf, 2*np.pi, np.inf])
+            popt, _ = curve_fit(sin_model, x, y, p0=p0, bounds=bounds, maxfev=20000)
+            y_pred = sin_model(x, *popt)
+            R2 = r2_score(y, y_pred)
+            params = [ _maybe_round(v, round_final) for v in popt ]
+
+        else:
+            return jsonify({"error":"Unhandled model."}), 400
+
+        return jsonify({"model": model, "params": params, "R2": _maybe_round(R2, round_final)})
 
     except Exception as e:
         return jsonify({"error": f"Regression failed: {e}"}), 400
+
 
 # ---------------------- Run ----------------------
 if __name__ == '__main__':
