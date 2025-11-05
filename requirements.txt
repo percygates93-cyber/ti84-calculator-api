@@ -1,7 +1,7 @@
-Flask
-Flask-Cors
-sympy
-numpy
-scipy
-gunicorn
-numdifftools
+Flask==3.0.0
+Flask-Cors==4.0.0
+sympy==1.12
+numpy==1.26.4
+scipy==1.11.4
+gunicorn==21.2.0
+numdifftools==0.9.41
