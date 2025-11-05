@@ -1,6 +1,12 @@
 # Bzzzt! This is the final, production-grade code for your calculator brain.
 # SymPy for symbolic work; SciPy / NumPy / numdifftools for numerical precision.
-# VERSION 4.2 – AP Calc AB/BC + Precalc Regressions + round_final toggle
+# VERSION 4.3 – AP Calc AB/BC + Precalc Regressions + round_final toggle
+# Changes in 4.3:
+#   • New helpers: _adaptive_eps, _as_funcs_for_calculus
+#   • Hardened _scan_brackets (catches touching/near-zero roots)
+#   • /critical works with f or f'  (expr_is_fprime)
+#   • /extrema classifies via sign of f', supports f' + f_anchor
+#   • New /inflectionFromFpp for direct f'' inputs
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -36,9 +42,44 @@ def _as_func(expr_str, var_name):
     expr = sympify(expr_str, locals={"Abs": Abs})
     return x, expr, lambdify(x, expr, modules=['numpy'])
 
-def _scan_brackets(f_vec, a, b, steps):
+# ---------------------- New helpers ----------------------
+def _adaptive_eps(a, b):
+    """Scale sampling epsilon with interval length; keep a floor for tiny intervals."""
+    L = float(b) - float(a)
+    return max(1e-9, 1e-4 * L)
+
+def _as_funcs_for_calculus(expr_str, var_name, mode="f"):
     """
-    Scan [a,b] with 'steps' subintervals to find brackets where f changes sign.
+    mode ∈ {"f", "fp", "fpp"}
+    Returns callables f, fp, fpp (some may be None depending on mode).
+
+    - mode="f":  expr is f; numeric derivatives supply fp and fpp.
+    - mode="fp": expr is f'; we DO NOT re-differentiate for extrema classification;
+                 we only need fp (and optionally numeric fpp).
+    - mode="fpp": expr is f''.
+    """
+    x = Symbol(var_name)
+    expr = sympify(expr_str, locals={"Abs": Abs})
+    f = fp = fpp = None
+
+    if mode == "f":
+        f = lambdify(x, expr, modules=['numpy'])
+        fp = lambda t: float(nd.Derivative(lambda s: f(s))(t))
+        fpp = lambda t: float(nd.Derivative(lambda s: f(s), n=2)(t))
+
+    elif mode == "fp":
+        fp = lambdify(x, expr, modules=['numpy'])
+        fpp = lambda t: float(nd.Derivative(lambda s: fp(s))(t))  # used only if requested
+
+    elif mode == "fpp":
+        fpp = lambdify(x, expr, modules=['numpy'])
+
+    return f, fp, fpp
+
+def _scan_brackets(f_vec, a, b, steps, tol_touch=1e-10):
+    """
+    Scan [a,b] with 'steps' subintervals to find brackets where f changes sign
+    or hits (near-)zero at grid points (catches touching roots).
     f_vec: vectorized function that accepts numpy array and returns array.
     """
     xs = np.linspace(a, b, steps + 1)
@@ -46,12 +87,14 @@ def _scan_brackets(f_vec, a, b, steps):
     br = []
     for i in range(len(xs) - 1):
         y1, y2 = vals[i], vals[i+1]
-        if np.isnan(y1) or np.isnan(y2) or np.isinf(y1) or np.isinf(y2):
+        if not np.isfinite(y1) or not np.isfinite(y2):
             continue
-        if y1 == 0.0:
-            br.append((xs[i], xs[i]))  # exact grid root
+        if abs(y1) <= tol_touch:
+            br.append((xs[i], xs[i]))          # exact/near grid root
+        elif abs(y2) <= tol_touch:
+            br.append((xs[i+1], xs[i+1]))      # exact/near grid root
         elif y1 * y2 < 0:
-            br.append((xs[i], xs[i+1]))
+            br.append((xs[i], xs[i+1]))        # sign change
     return br
 
 def _bisect_root(f_scalar, L, R):
@@ -200,22 +243,36 @@ def critical_points():
     round_final = _bool(d, "round_final", True)
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
+    expr_is_fprime = _bool(d, "expr_is_fprime", False)
+
     if not all([expr, var]) or a is None or b is None:
         return jsonify({"error": "Provide 'expression','variable','a','b'."}), 400
     try:
         a = _safe_float(a); b = _safe_float(b)
-        x, _, f = _as_func(expr, var)
-        def fp_scalar(t): return float(nd.Derivative(lambda s: f(s))(t))
+        mode = "fp" if expr_is_fprime else "f"
+        _, fp, _ = _as_funcs_for_calculus(expr, var, mode=mode)
+
+        def fp_scalar(t): return float(fp(t))
         def fp_vec(ts): return np.array([fp_scalar(t) for t in np.atleast_1d(ts)])
+
+        # Bracketed roots of f'
         brackets = _scan_brackets(fp_vec, a, b, steps)
-        cps = []
+        roots = []
         for L, R in brackets:
             r = _bisect_root(fp_scalar, L, R)
             if r is not None and a - 1e-12 <= r <= b + 1e-12:
-                cps.append(r)
-        cps = _dedupe_sorted(cps)
-        cps = [ _maybe_round(c, round_final) for c in cps ]
-        return jsonify({"critical_points": cps})
+                roots.append(r)
+
+        # Also catch near-zero grid points (touching zeros)
+        xs = np.linspace(a, b, steps + 1)
+        vals = fp_vec(xs)
+        for xi, vi in zip(xs, vals):
+            if np.isfinite(vi) and abs(vi) < 1e-8:
+                roots.append(float(xi))
+
+        roots = _dedupe_sorted(roots)
+        roots = [ _maybe_round(r, round_final) for r in roots ]
+        return jsonify({"critical_points": roots})
     except Exception as e:
         return jsonify({"error": f"Critical-point search failed: {e}"}), 400
 
@@ -225,34 +282,69 @@ def extrema():
     round_final = _bool(d, "round_final", True)
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
+    expr_is_fprime = _bool(d, "expr_is_fprime", False)
+    anchor = d.get('f_anchor', None)   # {"t":..., "value":...} optional
+
     if not all([expr, var]) or a is None or b is None:
         return jsonify({"error": "Provide 'expression','variable','a','b'."}), 400
     try:
         a = _safe_float(a); b = _safe_float(b)
-        x, _, f = _as_func(expr, var)
-        def fp_scalar(t): return float(nd.Derivative(lambda s: f(s))(t))
+        mode = "fp" if expr_is_fprime else "f"
+        f, fp, _ = _as_funcs_for_calculus(expr, var, mode=mode)
+
+        # If only f' is known but f-values are desired, synthesize f via anchor integration
+        F = f
+        if F is None and anchor:
+            t = Symbol(var)
+            fp_expr = sympify(expr, locals={"Abs": Abs})
+            fp_num = lambdify(t, fp_expr, modules=['numpy'])
+            t0 = _safe_float(anchor.get("t"))
+            f0 = _safe_float(anchor.get("value"))
+            def F(tt):
+                val, _ = quad(fp_num, t0, tt, limit=200)
+                return f0 + val
+
+        def fp_scalar(t): return float(fp(t))
         def fp_vec(ts): return np.array([fp_scalar(t) for t in np.atleast_1d(ts)])
+
+        # 1) Critical points = zeros of f'
         cps_raw = []
         for L, R in _scan_brackets(fp_vec, a, b, steps):
             r = _bisect_root(fp_scalar, L, R)
-            if r is not None: cps_raw.append(r)
+            if r is not None:
+                cps_raw.append(r)
+        # catch near-zero grid points (touching zeros)
+        xs = np.linspace(a, b, steps + 1)
+        vals = fp_vec(xs)
+        for xi, vi in zip(xs, vals):
+            if np.isfinite(vi) and abs(vi) < 1e-8:
+                cps_raw.append(float(xi))
         cps = _dedupe_sorted(cps_raw)
+
+        # 2) Classify via sign change of f'
+        eps = _adaptive_eps(a, b)
         results = []
         for xc in cps:
-            eps = 1e-3
-            left = fp_scalar(xc - eps)
-            right = fp_scalar(xc + eps)
-            if left > 0 and right < 0:
-                kind = "local_max"
-            elif left < 0 and right > 0:
-                kind = "local_min"
-            else:
-                kind = "neither"
-            results.append({"x": _maybe_round(xc, round_final),
-                            "type": kind,
-                            "f": _maybe_round(f(xc), round_final)})
-        endpoints = [{"x": _maybe_round(a, round_final), "f": _maybe_round(f(a), round_final)},
-                     {"x": _maybe_round(b, round_final), "f": _maybe_round(f(b), round_final)}]
+            sL = np.sign(fp_scalar(xc - eps))
+            sR = np.sign(fp_scalar(xc + eps))
+            kind = "neither"
+            if sL > 0 and sR < 0: kind = "local_max"
+            elif sL < 0 and sR > 0: kind = "local_min"
+            f_val = None
+            if F is not None:
+                f_val = _maybe_round(float(F(xc)), round_final)
+            results.append({
+                "x": _maybe_round(xc, round_final),
+                "type": kind,
+                "f": f_val
+            })
+
+        # 3) Always include endpoints (with f if available)
+        endpoints = [
+            {"x": _maybe_round(a, round_final), "f": (_maybe_round(float(F(a)), round_final) if F else None)},
+            {"x": _maybe_round(b, round_final), "f": (_maybe_round(float(F(b)), round_final) if F else None)}
+        ]
+
         return jsonify({"extrema": results, "endpoints": endpoints})
     except Exception as e:
         return jsonify({"error": f"Extrema classification failed: {e}"}), 400
@@ -275,16 +367,48 @@ def inflection_points():
             r = _bisect_root(fpp_scalar, L, R)
             if r is not None:
                 candidates.append(r)
+        eps = _adaptive_eps(a, b)
         pts = []
         for xc in _dedupe_sorted(candidates):
-            eps = 1e-3
             left = fpp_scalar(xc - eps)
             right = fpp_scalar(xc + eps)
-            if left * right < 0:
+            if np.isfinite(left) and np.isfinite(right) and np.sign(left) != np.sign(right):
                 pts.append(_maybe_round(xc, round_final))
         return jsonify({"inflection_points": pts})
     except Exception as e:
         return jsonify({"error": f"Inflection search failed: {e}"}), 400
+
+@app.route('/inflectionFromFpp', methods=['POST'])
+def inflection_from_fpp():
+    d = request.get_json()
+    round_final = _bool(d, "round_final", True)
+    expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
+    steps = int(d.get('steps', 400))
+    if not all([expr, var]) or a is None or b is None:
+        return jsonify({"error": "Provide 'expression','variable','a','b'."}), 400
+    try:
+        a = _safe_float(a); b = _safe_float(b)
+        _, _, fpp = _as_funcs_for_calculus(expr, var, mode="fpp")
+
+        def fpp_scalar(t): return float(fpp(t))
+        def fpp_vec(ts): return np.array([fpp_scalar(t) for t in np.atleast_1d(ts)])
+
+        candidates = []
+        for L, R in _scan_brackets(fpp_vec, a, b, steps):
+            r = _bisect_root(fpp_scalar, L, R)
+            if r is not None:
+                candidates.append(r)
+
+        eps = _adaptive_eps(a, b)
+        pts = []
+        for xc in _dedupe_sorted(candidates):
+            sL = np.sign(fpp_scalar(xc - eps))
+            sR = np.sign(fpp_scalar(xc + eps))
+            if np.isfinite(sL) and np.isfinite(sR) and sL != sR:
+                pts.append(_maybe_round(xc, round_final))
+        return jsonify({"inflection_points": pts})
+    except Exception as e:
+        return jsonify({"error": f"Inflection-from-fpp failed: {e}"}), 400
 
 # ---------------------- Cartesian Intersections ----------------------
 @app.route('/intersections', methods=['POST'])
@@ -798,3 +922,4 @@ def regression_fit():
 if __name__ == '__main__':
     # In production behind Render/Gunicorn, this block is ignored.
     app.run(host='0.0.0.0', port=5000)
+
