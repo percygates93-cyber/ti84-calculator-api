@@ -1,12 +1,10 @@
 # Bzzzt! This is the final, production-grade code for your calculator brain.
 # SymPy for symbolic work; SciPy / NumPy / numdifftools for numerical precision.
-# VERSION 4.3 – AP Calc AB/BC + Precalc Regressions + round_final toggle
-# Changes in 4.3:
-#   • New helpers: _adaptive_eps, _as_funcs_for_calculus
-#   • Hardened _scan_brackets (catches touching/near-zero roots)
-#   • /critical works with f or f'  (expr_is_fprime)
-#   • /extrema classifies via sign of f', supports f' + f_anchor
-#   • New /inflectionFromFpp for direct f'' inputs
+# VERSION 4.3+ – AP Calc AB/BC + Precalc Regressions + round_final toggle
+# Patch:
+#   • Request logging via @app.before_request
+#   • _refine_brackets to split multiple crossings inside one bin
+#   • /critical and /extrema now use scan + refine
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -18,6 +16,15 @@ import numdifftools as nd  # High-precision numerical derivatives
 
 app = Flask(__name__)
 CORS(app)
+
+# ---------------------- Request logging ----------------------
+@app.before_request
+def _log_incoming():
+    """Log path and JSON payload to Render logs for easy debugging."""
+    try:
+        print(">>", request.path, request.method, request.get_json(silent=True))
+    except Exception:
+        pass
 
 # ---------------------- Precision helpers ----------------------
 def _maybe_round(x, round_final=True):
@@ -52,11 +59,6 @@ def _as_funcs_for_calculus(expr_str, var_name, mode="f"):
     """
     mode ∈ {"f", "fp", "fpp"}
     Returns callables f, fp, fpp (some may be None depending on mode).
-
-    - mode="f":  expr is f; numeric derivatives supply fp and fpp.
-    - mode="fp": expr is f'; we DO NOT re-differentiate for extrema classification;
-                 we only need fp (and optionally numeric fpp).
-    - mode="fpp": expr is f''.
     """
     x = Symbol(var_name)
     expr = sympify(expr_str, locals={"Abs": Abs})
@@ -69,7 +71,8 @@ def _as_funcs_for_calculus(expr_str, var_name, mode="f"):
 
     elif mode == "fp":
         fp = lambdify(x, expr, modules=['numpy'])
-        fpp = lambda t: float(nd.Derivative(lambda s: fp(s))(t))  # used only if requested
+        # only used if needed explicitly
+        fpp = lambda t: float(nd.Derivative(lambda s: fp(s))(t))
 
     elif mode == "fpp":
         fpp = lambdify(x, expr, modules=['numpy'])
@@ -96,6 +99,31 @@ def _scan_brackets(f_vec, a, b, steps, tol_touch=1e-10):
         elif y1 * y2 < 0:
             br.append((xs[i], xs[i+1]))        # sign change
     return br
+
+# ---- NEW: refine brackets to split multiple crossings inside one bin ----
+def _refine_brackets(f_vec, brackets, L, R, steps_sub=1600):
+    """
+    Rescan each (l,r) bracket more finely to catch multiple sign changes inside one bin.
+    Keeps original brackets if no further crossings are found.
+    """
+    refined = []
+    span = max(1e-12, R - L)
+    for l, r in brackets:
+        if r <= l:
+            continue
+        width = r - l
+        n = max(16, int(steps_sub * (width / span)))
+        xs = np.linspace(l, r, n + 1)
+        vals = f_vec(xs)
+        for i in range(n):
+            y1, y2 = vals[i], vals[i+1]
+            if not np.isfinite(y1) or not np.isfinite(y2):
+                continue
+            if abs(y1) <= 1e-12:
+                refined.append((xs[i], xs[i]))
+            elif y1 * y2 < 0:
+                refined.append((xs[i], xs[i+1]))
+    return refined if refined else brackets
 
 def _bisect_root(f_scalar, L, R):
     """Refine a root in [L,R] via Brent; fallback to secant."""
@@ -232,7 +260,7 @@ def find_zeros():
             if r is not None and a - 1e-12 <= r <= b + 1e-12:
                 roots.append(r)
         roots = _dedupe_sorted(roots)
-        roots = [ _maybe_round(r, round_final) for r in roots ]
+        roots = [_maybe_round(r, round_final) for r in roots]
         return jsonify({"zeros": roots})
     except Exception as e:
         return jsonify({"error": f"Zero-finding failed: {e}"}), 400
@@ -255,8 +283,9 @@ def critical_points():
         def fp_scalar(t): return float(fp(t))
         def fp_vec(ts): return np.array([fp_scalar(t) for t in np.atleast_1d(ts)])
 
-        # Bracketed roots of f'
+        # Bracketed roots of f'  (scan + refine)
         brackets = _scan_brackets(fp_vec, a, b, steps)
+        brackets = _refine_brackets(fp_vec, brackets, a, b, steps_sub=max(800, steps*2))
         roots = []
         for L, R in brackets:
             r = _bisect_root(fp_scalar, L, R)
@@ -271,7 +300,7 @@ def critical_points():
                 roots.append(float(xi))
 
         roots = _dedupe_sorted(roots)
-        roots = [ _maybe_round(r, round_final) for r in roots ]
+        roots = [_maybe_round(r, round_final) for r in roots]
         return jsonify({"critical_points": roots})
     except Exception as e:
         return jsonify({"error": f"Critical-point search failed: {e}"}), 400
@@ -307,9 +336,11 @@ def extrema():
         def fp_scalar(t): return float(fp(t))
         def fp_vec(ts): return np.array([fp_scalar(t) for t in np.atleast_1d(ts)])
 
-        # 1) Critical points = zeros of f'
+        # 1) Critical points = zeros of f'  (scan + refine)
         cps_raw = []
-        for L, R in _scan_brackets(fp_vec, a, b, steps):
+        brackets = _scan_brackets(fp_vec, a, b, steps)
+        brackets = _refine_brackets(fp_vec, brackets, a, b, steps_sub=max(800, steps*2))
+        for L, R in brackets:
             r = _bisect_root(fp_scalar, L, R)
             if r is not None:
                 cps_raw.append(r)
@@ -432,7 +463,7 @@ def intersections():
                 xs.append(r)
         xs = _dedupe_sorted(xs)
         pts = [{"x": _maybe_round(t, round_final), "y": _maybe_round(f(t), round_final)} for t in xs]
-        xs = [ _maybe_round(t, round_final) for t in xs ]
+        xs = [_maybe_round(t, round_final) for t in xs]
         return jsonify({"x": xs, "points": pts})
     except Exception as e:
         return jsonify({"error": f"Intersections failed: {e}"}), 400
@@ -639,7 +670,7 @@ def polar_intersections():
             if r is not None:
                 roots.append(r)
         roots = _dedupe_sorted(roots)
-        roots = [ _maybe_round(r, round_final) for r in roots ]
+        roots = [_maybe_round(r, round_final) for r in roots]
         return jsonify({"thetas": roots})
     except Exception as e:
         return jsonify({"error": f"polarIntersections failed: {e}"}), 400
@@ -816,7 +847,7 @@ def regression_fit():
             coeffs = np.polyfit(x, y_hat, deg=deg)
             y_pred = np.polyval(coeffs, x)
             R2 = r2_score(y, y_pred)
-            params = [ _maybe_round(c, round_final) for c in coeffs ]
+            params = [_maybe_round(c, round_final) for c in coeffs]
 
         elif model == "exp":
             if np.any(y <= 0):
@@ -826,7 +857,7 @@ def regression_fit():
             a = np.exp(A); b = np.exp(B)
             y_pred = a*np.power(b, x)
             R2 = r2_score(y, y_pred)
-            params = [ _maybe_round(a, round_final), _maybe_round(b, round_final) ]
+            params = [_maybe_round(a, round_final), _maybe_round(b, round_final)]
 
         elif model == "log":
             if np.any(x <= 0):
@@ -835,7 +866,7 @@ def regression_fit():
             a, b = np.polyfit(Lx, y, 1)  # y = a*ln x + b
             y_pred = a*Lx + b
             R2 = r2_score(y, y_pred)
-            params = [ _maybe_round(a, round_final), _maybe_round(b, round_final) ]
+            params = [_maybe_round(a, round_final), _maybe_round(b, round_final)]
 
         elif model == "power":
             if np.any(x <= 0) or np.any(y <= 0):
@@ -845,7 +876,7 @@ def regression_fit():
             a = np.exp(ln_a)
             y_pred = a*np.power(x, b)
             R2 = r2_score(y, y_pred)
-            params = [ _maybe_round(a, round_final), _maybe_round(b, round_final) ]
+            params = [_maybe_round(a, round_final), _maybe_round(b, round_final)]
 
         elif model == "sinusoidal":
             # Stable harmonic fit: y ≈ A sin(ωx) + B cos(ωx) + D
@@ -916,10 +947,7 @@ def regression_fit():
     except Exception as e:
         return jsonify({"error": f"Regression failed: {e}"}), 400
 
-
-
 # ---------------------- Run ----------------------
 if __name__ == '__main__':
     # In production behind Render/Gunicorn, this block is ignored.
     app.run(host='0.0.0.0', port=5000)
-
