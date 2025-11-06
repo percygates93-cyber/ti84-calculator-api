@@ -5,6 +5,8 @@
 #   • Request logging via @app.before_request
 #   • _refine_brackets to split multiple crossings inside one bin
 #   • /critical and /extrema now use scan + refine
+#   • Guard /inflection from f′(x) misuse; add /inflectionFromFp
+#   • Gentle steps boost when expr_is_fprime=true
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -71,7 +73,7 @@ def _as_funcs_for_calculus(expr_str, var_name, mode="f"):
 
     elif mode == "fp":
         fp = lambdify(x, expr, modules=['numpy'])
-        # only used if needed explicitly
+        # numeric second derivative of f′ if needed
         fpp = lambda t: float(nd.Derivative(lambda s: fp(s))(t))
 
     elif mode == "fpp":
@@ -238,7 +240,7 @@ def numerical_differentiate():
         dval = nd.Derivative(lambda t: f(t))(x_val)
         return jsonify({"result": str(_maybe_round(dval, round_final))})
     except Exception as e:
-        return jsonify({"error": f"Numerical differentiation failed. {e}"}), 400
+        return jsonify({"error": f"Numerical differentiation failed: {e}"}), 400
 
 # ---------------------- Zeros / Critical / Extrema / Inflection ----------------------
 @app.route('/zeros', methods=['POST'])
@@ -272,6 +274,9 @@ def critical_points():
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
     expr_is_fprime = _bool(d, "expr_is_fprime", False)
+    # NEW: gentle steps boost for derivative inputs
+    if expr_is_fprime and steps < 900:
+        steps = 900
 
     if not all([expr, var]) or a is None or b is None:
         return jsonify({"error": "Provide 'expression','variable','a','b'."}), 400
@@ -312,6 +317,9 @@ def extrema():
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
     expr_is_fprime = _bool(d, "expr_is_fprime", False)
+    # NEW: gentle steps boost for derivative inputs
+    if expr_is_fprime and steps < 900:
+        steps = 900
     anchor = d.get('f_anchor', None)   # {"t":..., "value":...} optional
 
     if not all([expr, var]) or a is None or b is None:
@@ -384,6 +392,11 @@ def extrema():
 def inflection_points():
     d = request.get_json()
     round_final = _bool(d, "round_final", True)
+    # NEW: refuse f′ here (inflection of f must come from extrema of f′)
+    if _bool(d, "expr_is_fprime", False):
+        return jsonify({
+            "error": "Expression represents f′(x). Inflection points of f come from extrema of this derivative. Use /extrema with expr_is_fprime=true (or /inflectionFromFp)."
+        }), 400
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
     if not all([expr, var]) or a is None or b is None:
@@ -440,6 +453,63 @@ def inflection_from_fpp():
         return jsonify({"inflection_points": pts})
     except Exception as e:
         return jsonify({"error": f"Inflection-from-fpp failed: {e}"}), 400
+
+# -------- NEW: Inflection from f′(x) convenience endpoint ----------
+@app.route('/inflectionFromFp', methods=['POST'])
+def inflection_from_fp():
+    d = request.get_json()
+    round_final = _bool(d, "round_final", True)
+    expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
+    steps = int(d.get('steps', 400))
+    anchor = d.get('f_anchor', None)  # optional: {"t":..., "value":...}
+
+    if not all([expr, var]) or a is None or b is None:
+        return jsonify({"error": "Provide 'expression','variable','a','b'."}), 400
+    try:
+        a = _safe_float(a); b = _safe_float(b)
+        # Treat expression as f′(x)
+        _, fp, _ = _as_funcs_for_calculus(expr, var, mode="fp")
+
+        # Build f(x) from anchor if y-coordinates are desired
+        Fx = None
+        if anchor:
+            t = Symbol(var)
+            fp_expr = sympify(expr, locals={"Abs": Abs})
+            fp_num = lambdify(t, fp_expr, modules=['numpy'])
+            t0 = _safe_float(anchor.get("t"))
+            f0 = _safe_float(anchor.get("value"))
+            def Fx(tt):
+                val, _ = quad(fp_num, t0, tt, limit=200)
+                return f0 + val
+
+        # Use f′′(x)=0 (extrema of f′) with concavity flip to get inflection points of f
+        def fpp_scalar(x): return float(nd.Derivative(lambda s: fp(s))(x))
+        def fpp_vec(xs): return np.array([fpp_scalar(x) for x in np.atleast_1d(xs)])
+
+        brackets = _scan_brackets(fpp_vec, a, b, max(steps, 900))
+        brackets = _refine_brackets(fpp_vec, brackets, a, b, steps_sub=max(800, steps*2))
+
+        cand = []
+        for L, R in brackets:
+            r = _bisect_root(fpp_scalar, L, R)
+            if r is not None:
+                cand.append(r)
+
+        eps = _adaptive_eps(a, b)
+        xs = _dedupe_sorted(cand)
+        infl = []
+        for x0 in xs:
+            sL = np.sign(fpp_scalar(x0 - eps))
+            sR = np.sign(fpp_scalar(x0 + eps))
+            if np.isfinite(sL) and np.isfinite(sR) and sL != sR:
+                item = {"x": _maybe_round(x0, round_final)}
+                if Fx is not None:
+                    item["f"] = _maybe_round(float(Fx(x0)), round_final)
+                infl.append(item)
+
+        return jsonify({"inflection_points": infl})
+    except Exception as e:
+        return jsonify({"error": f"inflectionFromFp failed: {e}"}), 400
 
 # ---------------------- Cartesian Intersections ----------------------
 @app.route('/intersections', methods=['POST'])
