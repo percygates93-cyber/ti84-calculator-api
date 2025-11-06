@@ -853,30 +853,24 @@ def solve_for_t():
 def regression_fit():
     """
     Regression fit for model ∈ {linear, quadratic, cubic, quartic, exp, log, power, sinusoidal}.
-    JSON: {"model":"quadratic","x":[...],"y":[...],"round_final":true}
-    Returns: {"model":..., "params":[...], "R2":...}
+    JSON: {"model":"quadratic","x":[...],"y":[...]}
+    Returns: {"model":..., "params":[...], "R2":..., "equation_string": "..."}
     """
     from scipy.optimize import curve_fit
     d = request.get_json()
     model_in = (d.get('model') or "").strip().lower()
     x = d.get('x'); y = d.get('y')
-    round_final = _bool(d, "round_final", True)
+    round_final = _bool(d, "round_final", True) # We'll use this manually
     
-    # === THIS IS THE NEW CODE FOR REGRESSION (v4.4) ===
     period_hint = d.get("period_guess", None)
-    # === END OF NEW CODE ===
 
     if x is None or y is None or not len(x) or not len(y):
         return jsonify({"error":"Provide 'model','x','y' arrays."}), 400
 
-    # Accept common synonyms
     alias = {
-        "linear":"linear", "lin":"linear",
-        "quadratic":"quadratic", "quad":"quadratic",
-        "cubic":"cubic",
-        "quartic":"quartic", "4th":"quartic", "degree4":"quartic",
-        "exp":"exp", "exponential":"exp",
-        "log":"log", "logarithmic":"log",
+        "linear":"linear", "lin":"linear", "quadratic":"quadratic", "quad":"quadratic",
+        "cubic":"cubic", "quartic":"quartic", "4th":"quartic", "degree4":"quartic",
+        "exp":"exp", "exponential":"exp", "log":"log", "logarithmic":"log",
         "power":"power", "powerlaw":"power",
         "sin":"sinusoidal", "sine":"sinusoidal", "sinusoidal":"sinusoidal"
     }
@@ -887,43 +881,70 @@ def regression_fit():
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
 
-    # R² helper
     def r2_score(y_true, y_pred):
         ss_res = np.sum((y_true - y_pred)**2)
         ss_tot = np.sum((y_true - np.mean(y_true))**2)
         return 1.0 - (ss_res/ss_tot if ss_tot != 0 else 0.0)
 
+    # --- THIS IS THE NEW LOGIC (v4.7) ---
+    # We will store full-precision params for the equation_string
+    # and rounded params for the 'params' list.
+    
+    full_params = []
+    rounded_params = []
+    equation_string = ""
+    R2 = 0.0
+    var_str = "(x)" # Use (x) for most models
+
     try:
         if model in ("linear","quadratic","cubic","quartic"):
             deg = {"linear":1,"quadratic":2,"cubic":3,"quartic":4}[model]
-            # stabilize high-degree poly with centered x
+            # Fit on normalized data for stability
             x_mu, x_sigma = np.mean(x), (np.std(x) if np.std(x)>0 else 1.0)
             Xn = (x - x_mu)/x_sigma
             coeffs_n = np.polyfit(Xn, y, deg=deg)
             y_hat = np.polyval(coeffs_n, Xn)
-            coeffs = np.polyfit(x, y_hat, deg=deg)
-            y_pred = np.polyval(coeffs, x)
+            # Refit on original x to get user-friendly coefficients
+            full_params = np.polyfit(x, y_hat, deg=deg)
+            
+            y_pred = np.polyval(full_params, x)
             R2 = r2_score(y, y_pred)
-            params = [_maybe_round(c, round_final) for c in coeffs]
+            
+            # Create equation string
+            terms = []
+            for i, p in enumerate(full_params):
+                power = deg - i
+                if power > 1:
+                    terms.append(f"({p})*x**{power}")
+                elif power == 1:
+                    terms.append(f"({p})*x")
+                elif power == 0:
+                    terms.append(f"({p})")
+            equation_string = " + ".join(terms)
 
         elif model == "exp":
             if np.any(y <= 0):
                 return jsonify({"error":"Exponential regression requires y > 0."}), 400
             Y = np.log(y)
-            B, A = np.polyfit(x, Y, 1)   # Y = A + Bx
-            a = np.exp(A); b = np.exp(B)
-            y_pred = a*np.power(b, x)
-            R2 = r2_score(y, y_pred)
-            params = [_maybe_round(a, round_final), _maybe_round(b, round_final)]
+            B_lin, A_lin = np.polyfit(x, Y, 1)   # Y = A_lin + B_lin*x
+            a = np.exp(A_lin)
+            b = np.exp(B_lin)
+            full_params = [a, b]
+            
+            Y_pred_linear = A_lin + B_lin*x
+            R2 = r2_score(Y, Y_pred_linear) # Linearized R^2
+            equation_string = f"({a})*({b})**x"
 
         elif model == "log":
             if np.any(x <= 0):
                 return jsonify({"error":"Logarithmic regression requires x > 0."}), 400
             Lx = np.log(x)
-            a, b = np.polyfit(Lx, y, 1)  # y = a*ln x + b
+            a, b = np.polyfit(Lx, y, 1)  # y = a*ln(x) + b
+            full_params = [a, b]
+            
             y_pred = a*Lx + b
-            R2 = r2_score(y, y_pred)
-            params = [_maybe_round(a, round_final), _maybe_round(b, round_final)]
+            R2 = r2_score(y, y_pred) # This is already a linear R^2
+            equation_string = f"({a})*log(x) + ({b})" # Use SymPy 'log' for ln
 
         elif model == "power":
             if np.any(x <= 0) or np.any(y <= 0):
@@ -931,34 +952,25 @@ def regression_fit():
             Lx, Ly = np.log(x), np.log(y)
             b, ln_a = np.polyfit(Lx, Ly, 1)  # ln y = ln a + b ln x
             a = np.exp(ln_a)
-            y_pred = a*np.power(x, b)
-            R2 = r2_score(y, y_pred)
-            params = [_maybe_round(a, round_final), _maybe_round(b, round_final)]
+            full_params = [a, b]
+            
+            Ly_pred_linear = ln_a + b*Lx
+            R2 = r2_score(Ly, Ly_pred_linear) # Linearized R^2
+            equation_string = f"({a})*x**({b})"
 
         elif model == "sinusoidal":
-            # Stable harmonic fit: y ≈ A sin(ωx) + B cos(ωx) + D
             x_span = (np.max(x) - np.min(x)) if len(x) > 1 else 1.0
-
-            # Frequency range (rad/unit) based on span
-            w_min = float(d.get("w_min", 2*np.pi / (4.0 * x_span + 1e-9)))   # long periods
-            w_max = float(d.get("w_max", 2*np.pi / (0.5 * x_span + 1e-9)))   # short periods
-            if w_max < w_min:
-                w_min, w_max = w_max, w_min
-
-            # === THIS IS THE NEW CODE FOR REGRESSION (v4.4) ===
-            # Optional period hint
-            if period_hint is not None:
+            w_min = float(d.get("w_min", 2*np.pi / (4.0 * x_span + 1e-9)))
+            w_max = float(d.get("w_max", 2*np.pi / (0.5 * x_span + 1e-9)))
+            if w_max < w_min: w_min, w_max = w_max, w_min
+            if period_hint:
                 try:
                     w_hint = 2*np.pi / float(period_hint)
-                    w_min = min(w_min, w_hint*2.0)
-                    w_max = max(w_max, w_hint/2.0)
-                except Exception:
-                    pass
-            # === END OF NEW CODE ===
+                    w_min = min(w_min, w_hint*2.0); w_max = max(w_max, w_hint/2.0)
+                except Exception: pass
 
             def fit_for_omega(omega: float):
-                S = np.sin(omega * x)
-                Cc = np.cos(omega * x)
+                S, Cc = np.sin(omega * x), np.cos(omega * x)
                 M = np.column_stack([S, Cc, np.ones_like(x)])
                 coef, *_ = np.linalg.lstsq(M, y, rcond=None)
                 A_hat, B_hat, D_hat = coef
@@ -966,41 +978,49 @@ def regression_fit():
                 R2 = r2_score(y, y_pred)
                 return R2, A_hat, B_hat, D_hat
 
-            # coarse sweep
             ws = np.linspace(w_min, w_max, 300)
-            best = (-np.inf, None, None, None, None)
+            best = (-np.inf, 0, 0, 0, 0) # w, A, B, D
             for w in ws:
                 R2w, A, B, D0 = fit_for_omega(w)
-                if R2w > best[0]:
-                    best = (R2w, w, A, B, D0)
-
-            # local refine
+                if R2w > best[0]: best = (R2w, w, A, B, D0)
+            
             R2_best, w_best, A_best, B_best, D_best = best
-            w_lo = max(w_min, w_best*0.9)
-            w_hi = min(w_max, w_best*1.1)
+            w_lo, w_hi = max(w_min, w_best*0.9), min(w_max, w_best*1.1)
             ws2 = np.linspace(w_lo, w_hi, 120)
             for w in ws2:
                 R2w, A, B, D0 = fit_for_omega(w)
-                if R2w > R2_best:
-                    R2_best, w_best, A_best, B_best, D_best = R2w, w, A, B, D0
+                if R2w > R2_best: R2_best, w_best, A_best, B_best, D_best = R2w, w, A, B, D0
 
+            # Convert A*sin(wx) + B*cos(wx) to Amp*sin(wx + Phase) + D
+            # Amp = sqrt(A^2 + B^2)
+            # Phase = atan2(B, A) -- note: this is phase *shift*
+            # Our code uses a different form for simplicity, but let's
+            # return the standard y = A*sin(B(x-C)) + D form? No, that's too complex.
+            # Let's return y = Amp*sin(Freq*x + Phase) + Offset
+            
             amp   = float(np.hypot(A_best, B_best))
             phase = float(np.arctan2(B_best, A_best))
             freq  = float(w_best)
             offset= float(D_best)
-
-            params = [
-                _maybe_round(amp,   round_final),
-                _maybe_round(freq,  round_final),
-                _maybe_round(phase, round_final),
-                _maybe_round(offset,round_final)
-            ]
+            
+            full_params = [amp, freq, phase, offset]
             R2 = R2_best
+            var_str = "(x)"
+            # Use SymPy 'sin'
+            equation_string = f"({amp})*sin(({freq})*x + ({phase})) + ({offset})"
 
         else:
             return jsonify({"error":"Unhandled model."}), 400
 
-        return jsonify({"model": model, "params": params, "R2": _maybe_round(R2, round_final)})
+        # Now, create the rounded_params list
+        rounded_params = [_maybe_round(p, round_final) for p in full_params]
+
+        return jsonify({
+            "model": model, 
+            "params": rounded_params, # Rounded for display
+            "R2": _maybe_round(R2, round_final),
+            "equation_string": equation_string # Unrounded for calculation
+        })
 
     except Exception as e:
         return jsonify({"error": f"Regression failed: {e}"}), 400
