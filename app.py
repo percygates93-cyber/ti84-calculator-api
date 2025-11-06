@@ -1,12 +1,10 @@
 # Bzzzt! This is the final, production-grade code for your calculator brain.
 # SymPy for symbolic work; SciPy / NumPy / numdifftools for numerical precision.
-# VERSION 4.3+ – AP Calc AB/BC + Precalc Regressions + round_final toggle
+# VERSION 4.4 – AP Calc AB/BC + Precalc Regressions + Unified Inflection Logic
 # Patch:
-#   • Request logging via @app.before_request
-#   • _refine_brackets to split multiple crossings inside one bin
-#   • /critical and /extrema now use scan + refine
-#   • Guard /inflection from f′(x) misuse; add /inflectionFromFp
-#   • Gentle steps boost when expr_is_fprime=true
+#   • /inflection, /inflectionFromFp, /inflectionFromFpp MERGED into one /inflection
+#   • New /inflection endpoint uses expr_is_fprime/expr_is_fdoubleprime flags.
+#   • /regress now accepts 'period_guess' for sinusoidal stability.
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -95,11 +93,11 @@ def _scan_brackets(f_vec, a, b, steps, tol_touch=1e-10):
         if not np.isfinite(y1) or not np.isfinite(y2):
             continue
         if abs(y1) <= tol_touch:
-            br.append((xs[i], xs[i]))          # exact/near grid root
+            br.append((xs[i], xs[i]))      # exact/near grid root
         elif abs(y2) <= tol_touch:
-            br.append((xs[i+1], xs[i+1]))      # exact/near grid root
+            br.append((xs[i+1], xs[i+1]))    # exact/near grid root
         elif y1 * y2 < 0:
-            br.append((xs[i], xs[i+1]))        # sign change
+            br.append((xs[i], xs[i+1]))      # sign change
     return br
 
 # ---- NEW: refine brackets to split multiple crossings inside one bin ----
@@ -157,7 +155,7 @@ def _dedupe_sorted(vals, tol=1e-9):
 # ---------------------- Health Check ----------------------
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "Calculator brain is online and ready!"})
+    return jsonify({"status": "Calculator brain is online and ready! (v4.4)"})
 
 # ---------------------- Evaluate (numeric) ----------------------
 @app.route('/evaluate', methods=['POST'])
@@ -388,128 +386,94 @@ def extrema():
     except Exception as e:
         return jsonify({"error": f"Extrema classification failed: {e}"}), 400
 
+# === THIS IS THE NEW UNIFIED ENDPOINT ===
+# It replaces /inflection, /inflectionFromFp, and /inflectionFromFpp
 @app.route('/inflection', methods=['POST'])
 def inflection_points():
     d = request.get_json()
     round_final = _bool(d, "round_final", True)
-    # NEW: refuse f′ here (inflection of f must come from extrema of f′)
-    if _bool(d, "expr_is_fprime", False):
-        return jsonify({
-            "error": "Expression represents f′(x). Inflection points of f come from extrema of this derivative. Use /extrema with expr_is_fprime=true (or /inflectionFromFp)."
-        }), 400
-    expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
-    steps = int(d.get('steps', 400))
-    if not all([expr, var]) or a is None or b is None:
-        return jsonify({"error": "Provide 'expression','variable','a','b'."}), 400
-    try:
-        a = _safe_float(a); b = _safe_float(b)
-        x, _, f = _as_func(expr, var)
-        def fpp_scalar(t): return float(nd.Derivative(lambda s: f(s), n=2)(t))
-        def fpp_vec(ts): return np.array([fpp_scalar(t) for t in np.atleast_1d(ts)])
-        candidates = []
-        for L, R in _scan_brackets(fpp_vec, a, b, steps):
-            r = _bisect_root(fpp_scalar, L, R)
-            if r is not None:
-                candidates.append(r)
-        eps = _adaptive_eps(a, b)
-        pts = []
-        for xc in _dedupe_sorted(candidates):
-            left = fpp_scalar(xc - eps)
-            right = fpp_scalar(xc + eps)
-            if np.isfinite(left) and np.isfinite(right) and np.sign(left) != np.sign(right):
-                pts.append(_maybe_round(xc, round_final))
-        return jsonify({"inflection_points": pts})
-    except Exception as e:
-        return jsonify({"error": f"Inflection search failed: {e}"}), 400
+    
+    # 1. Read the NEW boolean flags from our new schema
+    expr_is_fprime = _bool(d, "expr_is_fprime", False)
+    expr_is_fdoubleprime = _bool(d, "expr_is_fdoubleprime", False)
 
-@app.route('/inflectionFromFpp', methods=['POST'])
-def inflection_from_fpp():
-    d = request.get_json()
-    round_final = _bool(d, "round_final", True)
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
+
     if not all([expr, var]) or a is None or b is None:
         return jsonify({"error": "Provide 'expression','variable','a','b'."}), 400
+    
     try:
         a = _safe_float(a); b = _safe_float(b)
-        _, _, fpp = _as_funcs_for_calculus(expr, var, mode="fpp")
+
+        # 2. Determine the correct 'mode' based on the flags
+        mode = "f"
+        if expr_is_fprime:
+            mode = "fp"
+        elif expr_is_fdoubleprime:
+            mode = "fpp"
+
+        # 3. Get the fpp(x) function.
+        # Your helper is perfect:
+        # - if mode="f", it does TWO derivatives
+        # - if mode="fp", it does ONE derivative
+        # - if mode="fpp", it does ZERO derivatives
+        _, _, fpp = _as_funcs_for_calculus(expr, var, mode=mode)
+        
+        if fpp is None:
+            return jsonify({"error": "Internal error: could not generate f''(x) function."}), 500
 
         def fpp_scalar(t): return float(fpp(t))
         def fpp_vec(ts): return np.array([fpp_scalar(t) for t in np.atleast_1d(ts)])
 
+        # 4. Find roots of f''(x) using your robust logic
+        
+        # Boost steps if input is already a derivative
+        scan_steps = steps
+        if mode in ("fp", "fpp") and steps < 900:
+            scan_steps = 900
+
+        # Bracketed roots of f'' (scan + refine)
+        brackets = _scan_brackets(fpp_vec, a, b, scan_steps)
+        brackets = _refine_brackets(fpp_vec, brackets, a, b, steps_sub=max(800, scan_steps*2))
+        
         candidates = []
-        for L, R in _scan_brackets(fpp_vec, a, b, steps):
+        for L, R in brackets:
             r = _bisect_root(fpp_scalar, L, R)
-            if r is not None:
+            if r is not None and a - 1e-12 <= r <= b + 1e-12:
                 candidates.append(r)
 
+        # Also catch near-zero grid points (touching zeros)
+        xs = np.linspace(a, b, scan_steps + 1)
+        vals = fpp_vec(xs)
+        for xi, vi in zip(xs, vals):
+            if np.isfinite(vi) and abs(vi) < 1e-8:
+                candidates.append(float(xi))
+        
+        # 5. Filter candidates for a TRUE sign change (definition of inflection point)
         eps = _adaptive_eps(a, b)
         pts = []
         for xc in _dedupe_sorted(candidates):
-            sL = np.sign(fpp_scalar(xc - eps))
-            sR = np.sign(fpp_scalar(xc + eps))
-            if np.isfinite(sL) and np.isfinite(sR) and sL != sR:
+            # Ensure sample points are strictly on either side
+            t_left = max(a, xc - eps)
+            t_right = min(b, xc + eps)
+            # Avoid sampling the same point if xc is at/near an endpoint
+            if t_right <= t_left:
+                continue
+                
+            sL = np.sign(fpp_scalar(t_left))
+            sR = np.sign(fpp_scalar(t_right))
+            
+            # Check for a strict sign change (e.g., - to + or + to -)
+            # sL != sR is a clean check, and implicitly handles sL/sR being non-zero
+            if np.isfinite(sL) and np.isfinite(sR) and sL != 0 and sR != 0 and sL != sR:
                 pts.append(_maybe_round(xc, round_final))
+
         return jsonify({"inflection_points": pts})
     except Exception as e:
-        return jsonify({"error": f"Inflection-from-fpp failed: {e}"}), 400
+        return jsonify({"error": f"Inflection search failed: {e}"}), 400
+# === END OF THE UNIFIED INFLECTION LOGIC ===
 
-# -------- NEW: Inflection from f′(x) convenience endpoint ----------
-@app.route('/inflectionFromFp', methods=['POST'])
-def inflection_from_fp():
-    d = request.get_json()
-    round_final = _bool(d, "round_final", True)
-    expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
-    steps = int(d.get('steps', 400))
-    anchor = d.get('f_anchor', None)  # optional: {"t":..., "value":...}
-
-    if not all([expr, var]) or a is None or b is None:
-        return jsonify({"error": "Provide 'expression','variable','a','b'."}), 400
-    try:
-        a = _safe_float(a); b = _safe_float(b)
-        # Treat expression as f′(x)
-        _, fp, _ = _as_funcs_for_calculus(expr, var, mode="fp")
-
-        # Build f(x) from anchor if y-coordinates are desired
-        Fx = None
-        if anchor:
-            t = Symbol(var)
-            fp_expr = sympify(expr, locals={"Abs": Abs})
-            fp_num = lambdify(t, fp_expr, modules=['numpy'])
-            t0 = _safe_float(anchor.get("t"))
-            f0 = _safe_float(anchor.get("value"))
-            def Fx(tt):
-                val, _ = quad(fp_num, t0, tt, limit=200)
-                return f0 + val
-
-        # Use f′′(x)=0 (extrema of f′) with concavity flip to get inflection points of f
-        def fpp_scalar(x): return float(nd.Derivative(lambda s: fp(s))(x))
-        def fpp_vec(xs): return np.array([fpp_scalar(x) for x in np.atleast_1d(xs)])
-
-        brackets = _scan_brackets(fpp_vec, a, b, max(steps, 900))
-        brackets = _refine_brackets(fpp_vec, brackets, a, b, steps_sub=max(800, steps*2))
-
-        cand = []
-        for L, R in brackets:
-            r = _bisect_root(fpp_scalar, L, R)
-            if r is not None:
-                cand.append(r)
-
-        eps = _adaptive_eps(a, b)
-        xs = _dedupe_sorted(cand)
-        infl = []
-        for x0 in xs:
-            sL = np.sign(fpp_scalar(x0 - eps))
-            sR = np.sign(fpp_scalar(x0 + eps))
-            if np.isfinite(sL) and np.isfinite(sR) and sL != sR:
-                item = {"x": _maybe_round(x0, round_final)}
-                if Fx is not None:
-                    item["f"] = _maybe_round(float(Fx(x0)), round_final)
-                infl.append(item)
-
-        return jsonify({"inflection_points": infl})
-    except Exception as e:
-        return jsonify({"error": f"inflectionFromFp failed: {e}"}), 400
 
 # ---------------------- Cartesian Intersections ----------------------
 @app.route('/intersections', methods=['POST'])
@@ -878,6 +842,10 @@ def regression_fit():
     model_in = (d.get('model') or "").strip().lower()
     x = d.get('x'); y = d.get('y')
     round_final = _bool(d, "round_final", True)
+    
+    # === THIS IS THE NEW CODE FOR REGRESSION ===
+    period_hint = d.get("period_guess", None)
+    # === END OF NEW CODE ===
 
     if x is None or y is None or not len(x) or not len(y):
         return jsonify({"error":"Provide 'model','x','y' arrays."}), 400
@@ -958,8 +926,8 @@ def regression_fit():
             if w_max < w_min:
                 w_min, w_max = w_max, w_min
 
+            # === THIS IS THE NEW CODE FOR REGRESSION ===
             # Optional period hint
-            period_hint = d.get("period_guess", None)
             if period_hint is not None:
                 try:
                     w_hint = 2*np.pi / float(period_hint)
@@ -967,6 +935,7 @@ def regression_fit():
                     w_max = max(w_max, w_hint/2.0)
                 except Exception:
                     pass
+            # === END OF NEW CODE ===
 
             def fit_for_omega(omega: float):
                 S = np.sin(omega * x)
