@@ -1,10 +1,11 @@
 # Bzzzt! This is the final, production-grade code for your calculator brain.
 # SymPy for symbolic work; SciPy / NumPy / numdifftools for numerical precision.
-# VERSION 4.4 – AP Calc AB/BC + Precalc Regressions + Unified Inflection Logic
+# VERSION 4.5 – AP Calc AB/BC + Precalc Regressions + Unified Inflection Logic
 # Patch:
 #   • /inflection, /inflectionFromFp, /inflectionFromFpp MERGED into one /inflection
 #   • New /inflection endpoint uses expr_is_fprime/expr_is_fdoubleprime flags.
 #   • /regress now accepts 'period_guess' for sinusoidal stability.
+#   • /extrema logic hardened to prevent min/max misclassification.
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -155,7 +156,7 @@ def _dedupe_sorted(vals, tol=1e-9):
 # ---------------------- Health Check ----------------------
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "Calculator brain is online and ready! (v4.4)"})
+    return jsonify({"status": "Calculator brain is online and ready! (v4.5)"})
 
 # ---------------------- Evaluate (numeric) ----------------------
 @app.route('/evaluate', methods=['POST'])
@@ -308,6 +309,7 @@ def critical_points():
     except Exception as e:
         return jsonify({"error": f"Critical-point search failed: {e}"}), 400
 
+# === THIS IS THE PATCHED /extrema (v4.5) ===
 @app.route('/extrema', methods=['POST'])
 def extrema():
     d = request.get_json()
@@ -315,7 +317,7 @@ def extrema():
     expr, var, a, b = d.get('expression'), d.get('variable'), d.get('a'), d.get('b')
     steps = int(d.get('steps', 400))
     expr_is_fprime = _bool(d, "expr_is_fprime", False)
-    # NEW: gentle steps boost for derivative inputs
+    
     if expr_is_fprime and steps < 900:
         steps = 900
     anchor = d.get('f_anchor', None)   # {"t":..., "value":...} optional
@@ -350,7 +352,7 @@ def extrema():
             r = _bisect_root(fp_scalar, L, R)
             if r is not None:
                 cps_raw.append(r)
-        # catch near-zero grid points (touching zeros)
+        
         xs = np.linspace(a, b, steps + 1)
         vals = fp_vec(xs)
         for xi, vi in zip(xs, vals):
@@ -359,17 +361,33 @@ def extrema():
         cps = _dedupe_sorted(cps_raw)
 
         # 2) Classify via sign change of f'
+        # === THIS IS THE PATCHED LOGIC (v4.5) ===
         eps = _adaptive_eps(a, b)
         results = []
         for xc in cps:
-            sL = np.sign(fp_scalar(xc - eps))
-            sR = np.sign(fp_scalar(xc + eps))
+            t_left = max(a, xc - eps)
+            t_right = min(b, xc + eps)
+            
             kind = "neither"
-            if sL > 0 and sR < 0: kind = "local_max"
-            elif sL < 0 and sR > 0: kind = "local_min"
+
+            # Avoid sampling the same point if xc is at/near an endpoint
+            if t_right <= t_left:
+                if abs(xc - a) < 1e-9 or abs(xc - b) < 1e-9:
+                    kind = "endpoint_critical_point" # Not a local min/max
+            else:
+                sL = np.sign(fp_scalar(t_left))
+                sR = np.sign(fp_scalar(t_right))
+                
+                # Check for a strict, non-zero sign change
+                if np.isfinite(sL) and np.isfinite(sR) and sL != 0 and sR != 0 and sL != sR:
+                    if sL > 0 and sR < 0: kind = "local_max"
+                    elif sL < 0 and sR > 0: kind = "local_min"
+            # === END OF PATCH ===
+
             f_val = None
             if F is not None:
                 f_val = _maybe_round(float(F(xc)), round_final)
+            
             results.append({
                 "x": _maybe_round(xc, round_final),
                 "type": kind,
@@ -385,9 +403,10 @@ def extrema():
         return jsonify({"extrema": results, "endpoints": endpoints})
     except Exception as e:
         return jsonify({"error": f"Extrema classification failed: {e}"}), 400
+# === END OF /extrema PATCH ===
 
-# === THIS IS THE NEW UNIFIED ENDPOINT ===
-# It replaces /inflection, /inflectionFromFp, and /inflectionFromFpp
+
+# === THIS IS THE UNIFIED /inflection (v4.4) ===
 @app.route('/inflection', methods=['POST'])
 def inflection_points():
     d = request.get_json()
@@ -843,7 +862,7 @@ def regression_fit():
     x = d.get('x'); y = d.get('y')
     round_final = _bool(d, "round_final", True)
     
-    # === THIS IS THE NEW CODE FOR REGRESSION ===
+    # === THIS IS THE NEW CODE FOR REGRESSION (v4.4) ===
     period_hint = d.get("period_guess", None)
     # === END OF NEW CODE ===
 
@@ -926,7 +945,7 @@ def regression_fit():
             if w_max < w_min:
                 w_min, w_max = w_max, w_min
 
-            # === THIS IS THE NEW CODE FOR REGRESSION ===
+            # === THIS IS THE NEW CODE FOR REGRESSION (v4.4) ===
             # Optional period hint
             if period_hint is not None:
                 try:
